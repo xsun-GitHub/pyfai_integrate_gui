@@ -1,0 +1,9 @@
+numpy
+PyQt6
+pyFAI
+silx
+fabio
+h5py
+qtawesome
+imageio
+imageio-ffmpeg
