@@ -15,8 +15,8 @@ performing one-dimensional azimuthal integration with pyFAI.
   using masked pixels as zero and an int64 accumulator.
 - Provides a Detector Sum tab plotting the masked detector sum for every
   selected image/frame against its sequence index.
-- Calculates the all-frame Detector Sum only on the first integration, then
-  reuses it until the image list, PONI geometry, or mask changes.
+- Calculates the all-frame Detector Sum only when its **Calculate** button is
+  clicked; normal integration does not calculate Detector Sum.
 - Recomputes detector dummy-pixel masks per frame while safely caching static masks.
 - Displays masks as a pink overlay on a `viridis` detector image.
 - Integrates in a worker thread and reuses pyFAI/HDF5 caches for better performance.
@@ -94,16 +94,28 @@ rectangular ROI workflow:
   rectangle over the required detector area. Drawing a new rectangle replaces
   the previous ROI.
 - **ROI Sum** appears beside **Integration** and **Detector Sum** in the top
-  menu-bar row.
+  menu-bar row and has its own **Calculate** button.
 - The ROI Sum X axis is the sequence index of every selected image/frame. Its Y
   axis is the total integer detector intensity inside the selected ROI for the
   corresponding frame.
 - Detector-mask and user-mask pixels inside the ROI contribute zero.
 - ROI coordinates refer to the full-resolution detector data, even when the
   displayed Source preview is downsampled.
-- On the first integration, Detector Sum and ROI Sum are calculated together
-  while each image/frame is read only once. The values are cached until the ROI,
-  image list, PONI geometry, or mask changes.
+- Detector Sum and ROI Sum are independent and run only from their respective
+  **Calculate** buttons. **Integrate** never calculates either series.
+- ROI Sum reports an error if no rectangle is selected. Detector-mask and
+  user-mask pixels contribute zero to both calculations.
+- Existing Detector/ROI curves remain visible during recalculation, after Stop,
+  and after ROI, PONI, or Mask changes. Both are cleared only when a new Image
+  selection replaces the current image list.
+- The value below Source displays a cached Detector Sum for the current frame,
+  or `not calculated`; it never performs a hidden sum during **Integrate**.
+- Version 2 renames **Start Integration** to **Integrate**, adds **Stop**, and
+  replaces Export Progress with a unified **Status** panel for loading,
+  integration, Sum calculations, and exports. Integrate is disabled while data
+  is loading.
+- Stop cancels at safe file/frame boundaries. A pyFAI call already running is
+  allowed to return safely, but its result is discarded.
 - When **ROI Sum** is the selected view, plot and video export include Source
   plus the ROI Sum plot.
 
@@ -122,10 +134,8 @@ The standard `pyfai_integrate_gui.py` remains available without ROI controls.
    and data type must match the sample image. A single-frame reference is reused
    for all data frames. A multi-frame reference is matched frame-by-frame and
    must have the same frame count as each multi-frame data file.
-5. Click **Start Integration**.
-   The first integration also calculates the Detector Sum series in the
-   background. Later integrations reuse it while images, PONI, and mask remain
-   unchanged.
+5. Click **Start Integration** in the standard version. Detector Sum is a
+   separate operation: open its tab and click **Calculate** when needed.
 6. Use **Show** to immediately show/hide a reference curve. Set **Subtract** and
    **Factor**, then click **Update** to recalculate the subtracted result.
 7. Use **Previous/Next** to navigate selected files or HDF5 frames.

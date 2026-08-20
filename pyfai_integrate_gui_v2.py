@@ -16,7 +16,9 @@ Version 2 additions
 - Optional cached Cake integration with shared 1-D controls and native colormap.
 - Single- or multi-frame Empty/Background references with frame matching,
   scaling, display, subtraction, and Clear controls.
-- Masked integer detector-sum display plus a cached all-image/frame Sum plot.
+- Detector Sum and rectangular ROI Sum are calculated only from their own
+  ``Calculate`` buttons and cached per image/frame; ``Integrate`` never computes
+  either sum, and the source label only displays an existing Detector Sum cache.
 - Multi-frame HDF5 navigation, automatic reintegration, and safer serialized
   background file processing on Windows.
 - Persistent export path, current-view plot export, grouped MP4 export, and
@@ -28,7 +30,7 @@ Basic use
 ---------
 1. Select one or more detector images, then load the matching PONI file.
 2. Optionally load a mask and Empty/Background reference images.
-3. Configure integration parameters and click ``Start Integration``.
+3. Configure integration parameters and click ``Integrate``.
 4. Use ``Show`` for immediate reference visibility; use ``Update`` after changing
    Subtract or Factor settings.
 5. Export results from ``File > Save``.
@@ -43,6 +45,7 @@ import threading
 import traceback
 import warnings
 import zlib
+import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,6 +66,24 @@ warnings.filterwarnings(
     "ignore",
     message="Ignoring fixed y limits to fulfill fixed data aspect.*",
     category=UserWarning,
+)
+
+
+class _MatplotlibHeavyWeightFilter(logging.Filter):
+    """Hide only Qt's harmless ``heavy`` -> 700 Matplotlib font fallback."""
+
+    def filter(self, record):
+        message = record.getMessage()
+        return not (
+            message.startswith("findfont: Failed to find font weight heavy")
+            and "now using 700" in message
+        )
+
+
+# silx maps a Qt heavy font to Matplotlib's equivalent numeric weight 700.
+# Keep all other font-manager warnings visible so real missing fonts are reported.
+logging.getLogger("matplotlib.font_manager").addFilter(
+    _MatplotlibHeavyWeightFilter()
 )
 
 
@@ -313,6 +334,7 @@ def group_batch_video_sources(sources):
 class IntegrationWorker(qt.QObject):
     finished = qt.Signal(object)
     failed = qt.Signal(str)
+    cancelled = qt.Signal()
 
     def __init__(
         self, image, integrator, mask, points, unit, radial_range,
@@ -330,10 +352,19 @@ class IntegrationWorker(qt.QObject):
         self.calculate_cake = calculate_cake
         self.cached_cake = cached_cake
         self.cake_cache_key = cake_cache_key
+        self._cancel_requested = threading.Event()
+
+    def cancel(self):
+        self._cancel_requested.set()
+
+    def _check_cancelled(self):
+        if self._cancel_requested.is_set():
+            raise InterruptedError
 
     @qt.Slot()
     def run(self):
         try:
+            self._check_cancelled()
             result = self.integrator.integrate1d(
                 self.image,
                 self.points,
@@ -355,6 +386,7 @@ class IntegrationWorker(qt.QObject):
             }
             corrected = payload["sample"].copy()
             for name, data, show, subtract, factor, cache_key, cached in self.references:
+                self._check_cancelled()
                 if cached is None:
                     ref_result = self.integrator.integrate1d(
                         data, self.points, mask=self.mask, unit=self.unit,
@@ -374,6 +406,7 @@ class IntegrationWorker(qt.QObject):
             # Cake is deliberately last: all 1-D and subtraction work finishes
             # before the higher-memory 2-D integration starts.
             if self.calculate_cake and payload["cake"] is None:
+                self._check_cancelled()
                 cake = self.integrator.integrate2d(
                     self.image, self.points, 360, mask=self.mask, unit=self.unit,
                     radial_range=self.radial_range,
@@ -385,24 +418,38 @@ class IntegrationWorker(qt.QObject):
                     "radial": np.asarray(cake.radial),
                     "azimuthal": np.asarray(cake.azimuthal),
                 }
+            self._check_cancelled()
             self.finished.emit(payload)
+        except InterruptedError:
+            self.cancelled.emit()
         except Exception:
             self.failed.emit(traceback.format_exc())
 
 
 class DetectorMaskWorker(qt.QObject):
     finished = qt.Signal(object, int, str)
+    cancelled = qt.Signal()
 
     def __init__(self, detector, image, generation):
         super().__init__()
         self.detector = detector
         self.image = image
         self.generation = generation
+        self._cancel_requested = threading.Event()
+
+    def cancel(self):
+        self._cancel_requested.set()
 
     @qt.Slot()
     def run(self):
         try:
+            if self._cancel_requested.is_set():
+                self.cancelled.emit()
+                return
             mask = detector_mask_for_image(self.detector, self.image)
+            if self._cancel_requested.is_set():
+                self.cancelled.emit()
+                return
             if mask is not None:
                 mask = np.asarray(mask, dtype=bool)
                 if mask.shape != self.image.shape:
@@ -416,10 +463,11 @@ class DetectorSumWorker(qt.QObject):
     progress = qt.Signal(int, object, object, int)
     finished = qt.Signal(object, int)
     failed = qt.Signal(str, int)
+    cancelled = qt.Signal()
 
     def __init__(
         self, sources, poni, user_mask, generation, roi_bounds=None,
-        mode="detector",
+        mode="detector", detector_mask_cache=None,
     ):
         super().__init__()
         self.sources = sources
@@ -428,15 +476,25 @@ class DetectorSumWorker(qt.QObject):
         self.generation = generation
         self.roi_bounds = roi_bounds
         self.mode = mode
+        # Reuse static masks already prepared by the GUI. Dynamic dummy masks
+        # are intentionally recalculated per frame because their pixels differ.
+        self.detector_mask_cache = dict(detector_mask_cache or {})
+        self._cancel_requested = threading.Event()
+
+    def cancel(self):
+        self._cancel_requested.set()
 
     @qt.Slot()
     def run(self):
         try:
             integrator = pyFAI.load(self.poni) if self.poni else None
-            static_mask_cache = {}
+            static_mask_cache = dict(self.detector_mask_cache)
             values = []
             roi_values = []
             for index, source in enumerate(self.sources):
+                if self._cancel_requested.is_set():
+                    self.cancelled.emit()
+                    return
                 image = read_image(source)
                 require_integer_detector_image(image, source.title)
                 detector_mask = None
@@ -468,21 +526,25 @@ class DetectorSumWorker(qt.QObject):
                 if self.mode == "detector":
                     detector_value = masked_intensity_sum(image, mask)
                     values.append(detector_value)
-                if self.mode == "roi" and self.roi_bounds is not None:
+                elif self.mode == "roi" and self.roi_bounds is not None:
                     left, top, right, bottom = self.roi_bounds
-                    roi_image = image[top:bottom, left:right]
                     roi_mask = None if mask is None else mask[top:bottom, left:right]
-                    roi_value = masked_intensity_sum(roi_image, roi_mask)
+                    roi_value = masked_intensity_sum(
+                        image[top:bottom, left:right], roi_mask
+                    )
                     roi_values.append(roi_value)
                 self.progress.emit(
                     index, detector_value, roi_value, self.generation
                 )
                 del image, mask, detector_mask
             self.finished.emit(
-                {"mode": self.mode, "values": (
-                    np.asarray(values, dtype=np.int64),
-                    np.asarray(roi_values, dtype=np.int64),
-                )},
+                {
+                    "mode": self.mode,
+                    "values": np.asarray(
+                        values if self.mode == "detector" else roi_values,
+                        dtype=np.int64,
+                    ),
+                },
                 self.generation,
             )
         except Exception:
@@ -493,6 +555,7 @@ class BatchIntegrationWorker(qt.QObject):
     progress = qt.Signal(int, int, str)
     finished = qt.Signal(str, int)
     failed = qt.Signal(str)
+    cancelled = qt.Signal()
 
     def __init__(
         self, paths, output_dir, poni, user_mask, points, unit, radial_range,
@@ -509,6 +572,10 @@ class BatchIntegrationWorker(qt.QObject):
         self.radial_range = radial_range
         self.azimuth_range = azimuth_range
         self.references = references or []
+        self._cancel_requested = threading.Event()
+
+    def cancel(self):
+        self._cancel_requested.set()
 
     @qt.Slot()
     def run(self):
@@ -519,6 +586,9 @@ class BatchIntegrationWorker(qt.QObject):
             reference_cache = {}
             total = len(self.paths)
             for index, path in enumerate(self.paths, 1):
+                if self._cancel_requested.is_set():
+                    self.cancelled.emit()
+                    return
                 if isinstance(path, ImageSource) and path.frame is not None:
                     reader = readers.get(path.path)
                     if reader is None:
@@ -564,24 +634,12 @@ class BatchIntegrationWorker(qt.QObject):
                 corrected = np.asarray(result.intensity).copy()
                 reference_columns = []
                 for name, ref_sources, _ref_file, factor, subtract in self.references:
+                    if self._cancel_requested.is_set():
+                        self.cancelled.emit()
+                        return
                     ref_source = matching_reference_source(ref_sources, path)
-                    if ref_source.frame is not None:
-                        ref_reader = readers.get(ref_source.path)
-                        if ref_reader is None:
-                            ref_reader = fabio.open(ref_source.path)
-                            readers[ref_source.path] = ref_reader
-                        ref_data = np.asarray(
-                            ref_reader.getframe(ref_source.frame).data
-                        )
-                    else:
-                        ref_data = read_image(ref_source)
-                    if ref_data.shape != image.shape or ref_data.dtype != image.dtype:
-                        raise ValueError(
-                            f"{name} format does not match {source_name}"
-                        )
-                    # The detector geometry, mask and reference image are
-                    # identical for every sample of this shape. Integrate each
-                    # reference once and only apply its factor per output file.
+                    # Key before reading: a cache hit avoids both reopening the
+                    # reference frame and repeating its pyFAI integration.
                     cache_key = (
                         name,
                         os.path.abspath(ref_source.path),
@@ -590,6 +648,23 @@ class BatchIntegrationWorker(qt.QObject):
                     )
                     reference_intensity = reference_cache.get(cache_key)
                     if reference_intensity is None:
+                        if ref_source.frame is not None:
+                            ref_reader = readers.get(ref_source.path)
+                            if ref_reader is None:
+                                ref_reader = fabio.open(ref_source.path)
+                                readers[ref_source.path] = ref_reader
+                            ref_data = np.asarray(
+                                ref_reader.getframe(ref_source.frame).data
+                            )
+                        else:
+                            ref_data = read_image(ref_source)
+                        if (
+                            ref_data.shape != image.shape
+                            or ref_data.dtype != image.dtype
+                        ):
+                            raise ValueError(
+                                f"{name} format does not match {source_name}"
+                            )
                         ref_result = integrator.integrate1d(
                             ref_data, self.points, mask=mask, unit=self.unit,
                             radial_range=self.radial_range,
@@ -631,6 +706,39 @@ class BatchIntegrationWorker(qt.QObject):
         finally:
             for reader in readers.values():
                 reader.close()
+
+
+class ImageLoadWorker(qt.QObject):
+    progress = qt.Signal(int, int, str)
+    finished = qt.Signal(object)
+    failed = qt.Signal(str)
+    cancelled = qt.Signal()
+
+    def __init__(self, filenames):
+        super().__init__()
+        self.filenames = list(filenames)
+        self._cancel_requested = threading.Event()
+
+    def cancel(self):
+        self._cancel_requested.set()
+
+    @qt.Slot()
+    def run(self):
+        try:
+            sources = []
+            total = len(self.filenames)
+            for index, filename in enumerate(self.filenames, 1):
+                if self._cancel_requested.is_set():
+                    self.cancelled.emit()
+                    return
+                sources.extend(expand_image_file(filename))
+                self.progress.emit(index, total, Path(filename).name)
+            if self._cancel_requested.is_set():
+                self.cancelled.emit()
+            else:
+                self.finished.emit(sources)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
 
 
 class RawArrayTableModel(qt.QAbstractTableModel):
@@ -945,14 +1053,22 @@ class MainWindow(qt.QMainWindow):
         self.integrator = None
         self._thread = None
         self._worker = None
+        self._load_thread = None
+        self._load_worker = None
+        self._operation_cancel_requested = False
+        self._integration_worker_payload = None
+        self._integration_worker_error = None
         self._mask_generation = 0
         self._mask_jobs = []
         self._detector_sum_generation = 0
         self._detector_sum_jobs = []
         self._detector_sum_restart_pending = False
         self._detector_sum_valid = False
-        self._integration_waiting_for_detector_sum = False
+        self._roi_sum_valid = False
+        self._sum_calculation_mode = None
         self._detector_sum_values = np.empty(0, dtype=np.int64)
+        self._detector_sum_by_source = {}
+        self._sum_job_sources = []
         self._roi_sum_values = np.empty(0, dtype=np.int64)
         self._roi_bounds = None
         self._detector_mask_cache = {}
@@ -972,6 +1088,8 @@ class MainWindow(qt.QMainWindow):
         self._progress_blocks = {}
         self._batch_thread = None
         self._batch_worker = None
+        self._batch_worker_result = None
+        self._batch_worker_error = None
         self._combined_export_video_dir = None
         self._combined_export_plot_path = None
         self._last_integration_payload = None
@@ -1229,18 +1347,30 @@ class MainWindow(qt.QMainWindow):
         form.addRow(self.update_references_button)
         form_box.addWidget(options)
 
-        self.integrate_button = qt.QPushButton("Start Integration")
+        operation_buttons = qt.QWidget()
+        operation_layout = qt.QHBoxLayout(operation_buttons)
+        operation_layout.setContentsMargins(0, 0, 0, 0)
+        self.integrate_button = qt.QPushButton("Integrate")
         self.integrate_button.setMinimumHeight(42)
+        self.integrate_button.setEnabled(False)
         self.integrate_button.clicked.connect(self.start_integration)
-        form_box.addWidget(self.integrate_button)
+        self.stop_button = qt.QPushButton("Stop")
+        self.stop_button.setMinimumHeight(42)
+        self.stop_button.setEnabled(False)
+        self.stop_button.clicked.connect(self.stop_current_operation)
+        operation_layout.addWidget(self.integrate_button, 1)
+        operation_layout.addWidget(self.stop_button)
+        form_box.addWidget(operation_buttons)
         self.status_label = qt.QLabel("Select a 2-D diffraction image and a PONI file")
         self.status_label.setWordWrap(True)
         form_box.addWidget(self.status_label)
-        progress_box = qt.QGroupBox("Export Progress")
+        progress_box = qt.QGroupBox("Status")
         progress_layout = qt.QVBoxLayout(progress_box)
         self.export_progress = qt.QPlainTextEdit()
         self.export_progress.setReadOnly(True)
-        self.export_progress.setPlaceholderText("Video and data export progress appears here")
+        self.export_progress.setPlaceholderText(
+            "Loading, integration, and export status appears here"
+        )
         self.export_progress.setMinimumHeight(130)
         self.export_progress.setMaximumBlockCount(1000)
         progress_layout.addWidget(self.export_progress)
@@ -1264,6 +1394,8 @@ class MainWindow(qt.QMainWindow):
         )
         self.image_plot.toolBar().addAction(self.roi_action)
         self.roi_manager.sigRoiAdded.connect(self._roi_added)
+        if hasattr(self.roi_manager, "sigRoiRemoved"):
+            self.roi_manager.sigRoiRemoved.connect(self._roi_removed)
         source_position = self.image_plot.getPositionInfoWidget()
         if source_position is not None and len(source_position._fields) >= 3:
             value_label, _name, _converter = source_position._fields[2]
@@ -1455,14 +1587,36 @@ class MainWindow(qt.QMainWindow):
         self.detector_sum_plot.setGraphTitle("Detector sum intensity")
         self.detector_sum_plot.setGraphXLabel("Image / frame index")
         self.detector_sum_plot.setGraphYLabel("Detector sum intensity")
+        detector_sum_container = qt.QWidget()
+        self.detector_sum_container = detector_sum_container
+        detector_sum_layout = qt.QVBoxLayout(detector_sum_container)
+        detector_sum_layout.setContentsMargins(0, 0, 0, 0)
+        self.detector_sum_calculate_button = qt.QPushButton("Calculate")
+        self.detector_sum_calculate_button.setEnabled(False)
+        self.detector_sum_calculate_button.clicked.connect(
+            lambda: self._start_detector_sum_update("detector")
+        )
+        detector_sum_layout.addWidget(self.detector_sum_calculate_button)
+        detector_sum_layout.addWidget(self.detector_sum_plot, 1)
         self.roi_sum_plot = Plot1D()
         self.roi_sum_plot.setGraphTitle("ROI sum intensity")
         self.roi_sum_plot.setGraphXLabel("Image / frame index")
         self.roi_sum_plot.setGraphYLabel("ROI sum intensity")
+        roi_sum_container = qt.QWidget()
+        self.roi_sum_container = roi_sum_container
+        roi_sum_layout = qt.QVBoxLayout(roi_sum_container)
+        roi_sum_layout.setContentsMargins(0, 0, 0, 0)
+        self.roi_sum_calculate_button = qt.QPushButton("Calculate")
+        self.roi_sum_calculate_button.setEnabled(False)
+        self.roi_sum_calculate_button.clicked.connect(
+            lambda: self._start_detector_sum_update("roi")
+        )
+        roi_sum_layout.addWidget(self.roi_sum_calculate_button)
+        roi_sum_layout.addWidget(self.roi_sum_plot, 1)
         self.right_stack = qt.QStackedWidget()
         self.right_stack.addWidget(integration_container)
-        self.right_stack.addWidget(self.detector_sum_plot)
-        self.right_stack.addWidget(self.roi_sum_plot)
+        self.right_stack.addWidget(detector_sum_container)
+        self.right_stack.addWidget(roi_sum_container)
         self.right_tab_bar = qt.QTabBar()
         self.right_tab_bar.addTab("Integration")
         self.right_tab_bar.addTab("Detector Sum")
@@ -1791,6 +1945,7 @@ class MainWindow(qt.QMainWindow):
         running = [
             thread for thread in (
                 self._thread,
+                self._load_thread,
                 self._batch_thread,
                 *(job[0] for job in self._mask_jobs),
                 *(job[0] for job in self._detector_sum_jobs),
@@ -1837,12 +1992,71 @@ class MainWindow(qt.QMainWindow):
 
     def _update_navigation_buttons(self):
         count = len(self.image_paths)
-        idle = (
-            self._thread is None and not self._exporting_video
-            and self._batch_thread is None and not self._detector_sum_jobs
-        )
+        idle = not self._has_active_operation()
         self.previous_image_button.setEnabled(idle and count > 1 and self.image_index > 0)
         self.next_image_button.setEnabled(idle and count > 1 and self.image_index < count - 1)
+        if hasattr(self, "integrate_button"):
+            can_integrate = (
+                idle and self.image_data is not None and self.integrator is not None
+            )
+            self.integrate_button.setEnabled(can_integrate)
+        if hasattr(self, "stop_button"):
+            self.stop_button.setEnabled(not idle)
+        if hasattr(self, "detector_sum_calculate_button"):
+            sums_available = idle and bool(self.image_paths)
+            self.detector_sum_calculate_button.setEnabled(sums_available)
+            self.roi_sum_calculate_button.setEnabled(sums_available)
+        if hasattr(self, "save_current_action"):
+            self._set_save_actions_enabled(idle)
+
+    def _has_active_operation(self):
+        return bool(
+            self._load_thread is not None
+            or self._thread is not None
+            or self._batch_thread is not None
+            or self._exporting_video
+            or self._mask_jobs
+            or self._detector_sum_jobs
+        )
+
+    @qt.Slot()
+    def stop_current_operation(self):
+        """Request cancellation for every active loading, calculation, or export."""
+        if not self._has_active_operation():
+            return
+        self._operation_cancel_requested = True
+        self._pending_auto_integration = False
+        self._auto_integrate_images = False
+        self._detector_sum_restart_pending = False
+        self._combined_export_video_dir = None
+        self._combined_export_plot_path = None
+        self._batch_video_queue.clear()
+        for worker in (
+            self._load_worker,
+            self._worker,
+            self._batch_worker,
+            *(job[1] for job in self._mask_jobs),
+            *(job[1] for job in self._detector_sum_jobs),
+        ):
+            if worker is not None and hasattr(worker, "cancel"):
+                worker.cancel()
+        self.status_label.setText("Stopping current operation…")
+        self._update_export_progress_block(
+            "operation", "Operation", "stopping…"
+        )
+        self._update_navigation_buttons()
+        if self._exporting_video:
+            self._finish_video_export(False, cancelled=True)
+            return
+
+    def _operation_stopped(self):
+        if self._has_active_operation():
+            return
+        self._operation_cancel_requested = False
+        self.status_label.setText("Operation stopped")
+        self._update_export_progress_block("operation", "Operation", "stopped")
+        self._set_save_actions_enabled(True)
+        self._update_navigation_buttons()
 
     def _image_position_text(self):
         if not self.image_paths or self.image_index < 0:
@@ -1993,13 +2207,6 @@ class MainWindow(qt.QMainWindow):
                 resetzoom=False,
             )
         self.image_plot.setActiveImage("detector image")
-        if self._roi_bounds is not None and not self.roi_manager.getRois():
-            left, top, right, bottom = self._roi_bounds
-            roi = RectangleROI()
-            roi.setGeometry(
-                origin=(left, top), size=(right - left, bottom - top)
-            )
-            self.roi_manager.addRoi(roi)
         return step
 
     def _effective_mask(self):
@@ -2034,14 +2241,20 @@ class MainWindow(qt.QMainWindow):
         return self.image_data[row, column]
 
     def _update_source_sum_label(self):
+        """Display only a cached Calculate result; never sum during Integrate."""
         if self.image_data is None:
             self.source_sum_label.setText(
                 "Detector sum intensity: no image loaded"
             )
             return
-        value = masked_intensity_sum(self.image_data, self._effective_mask())
+        value = self._detector_sum_by_source.get(self._current_source_key())
+        if value is None:
+            self.source_sum_label.setText(
+                "Detector sum intensity: not calculated"
+            )
+            return
         self.source_sum_label.setText(
-            f"Detector sum intensity (after mask): {value:,d}"
+            f"Detector sum intensity (calculated): {int(value):,d}"
         )
 
     def _roi_added(self, roi):
@@ -2054,6 +2267,11 @@ class MainWindow(qt.QMainWindow):
         roi.sigRegionChanged.connect(self._roi_geometry_changed)
         self._roi_geometry_changed()
 
+    def _roi_removed(self, _roi):
+        if not self.roi_manager.getRois():
+            self._roi_bounds = None
+            self._invalidate_detector_sum(roi_only=True)
+
     @qt.Slot()
     def _roi_geometry_changed(self):
         rois = self.roi_manager.getRois()
@@ -2064,27 +2282,34 @@ class MainWindow(qt.QMainWindow):
             size = rois[-1].getSize()
             left = max(0, int(np.floor(origin[0])))
             top = max(0, int(np.floor(origin[1])))
-            right = min(self.image_data.shape[1], int(np.ceil(origin[0] + size[0])))
-            bottom = min(self.image_data.shape[0], int(np.ceil(origin[1] + size[1])))
+            right = min(
+                self.image_data.shape[1], int(np.ceil(origin[0] + size[0]))
+            )
+            bottom = min(
+                self.image_data.shape[0], int(np.ceil(origin[1] + size[1]))
+            )
             self._roi_bounds = (
                 (left, top, right, bottom)
                 if right > left and bottom > top else None
             )
-        self._invalidate_detector_sum()
+        self._invalidate_detector_sum(roi_only=True)
 
-    def _start_detector_sum_update(self):
-        """Calculate masked sums for every selected image/frame off the GUI thread."""
-        if self._detector_sum_valid:
+    def _start_detector_sum_update(self, mode="detector"):
+        """Calculate detector or ROI sums for every selected image/frame."""
+        if mode == "roi" and self._roi_bounds is None:
+            self.show_error(
+                "ROI Required",
+                "Select a rectangular ROI on the detector image before calculating ROI Sum.",
+            )
             return
-        self._detector_sum_generation += 1
-        generation = self._detector_sum_generation
-        self._detector_sum_values = np.empty(0, dtype=np.int64)
-        self.detector_sum_plot.clear()
         if not self.image_paths:
             return
         if self._detector_sum_jobs:
-            self._detector_sum_restart_pending = True
             return
+        self._detector_sum_generation += 1
+        generation = self._detector_sum_generation
+        self._sum_calculation_mode = mode
+        self._sum_job_sources = list(self.image_paths)
         # Fabio/HDF5 readers are not reliably thread-safe on Windows. Release
         # GUI-owned persistent readers before the worker opens the same files,
         # and disable navigation until that worker has finished.
@@ -2095,15 +2320,20 @@ class MainWindow(qt.QMainWindow):
         thread = qt.QThread(self)
         worker = DetectorSumWorker(
             list(self.image_paths), poni, self.mask_data, generation,
-            self._roi_bounds,
+            self._roi_bounds if mode == "roi" else None, mode,
+            self._detector_mask_cache,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
+        worker.progress.connect(self._detector_sum_progress)
         worker.finished.connect(self._detector_sum_finished)
         worker.failed.connect(self._detector_sum_failed)
+        worker.cancelled.connect(thread.quit)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        worker.cancelled.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         job = (thread, worker)
         self._detector_sum_jobs.append(job)
@@ -2111,70 +2341,94 @@ class MainWindow(qt.QMainWindow):
             lambda job=job: self._remove_detector_sum_job(job)
         )
         self._update_navigation_buttons()
+        self.detector_sum_calculate_button.setEnabled(False)
+        self.roi_sum_calculate_button.setEnabled(False)
         thread.start()
 
-    def _invalidate_detector_sum(self):
-        """Invalidate cached all-frame sums without starting any file reads."""
-        self._detector_sum_generation += 1
-        self._detector_sum_valid = False
+    def _invalidate_detector_sum(self, clear=False, roi_only=False):
+        """Mark cached sums stale, preserving curves unless images are replaced."""
+        if not roi_only:
+            self._detector_sum_valid = False
+        self._roi_sum_valid = False
         self._detector_sum_restart_pending = False
-        self._detector_sum_values = np.empty(0, dtype=np.int64)
-        self._roi_sum_values = np.empty(0, dtype=np.int64)
-        self.detector_sum_plot.clear()
-        self.roi_sum_plot.clear()
+        if clear:
+            self._detector_sum_generation += 1
+            self._detector_sum_values = np.empty(0, dtype=np.int64)
+            self._detector_sum_by_source.clear()
+            self._sum_job_sources = []
+            self._roi_sum_values = np.empty(0, dtype=np.int64)
+            self.detector_sum_plot.clear()
+            self.roi_sum_plot.clear()
 
     def _remove_detector_sum_job(self, job):
         if job in self._detector_sum_jobs:
             self._detector_sum_jobs.remove(job)
         self._update_navigation_buttons()
-        if not self._detector_sum_jobs and self._detector_sum_restart_pending:
-            self._detector_sum_restart_pending = False
-            qt.QTimer.singleShot(0, self._start_detector_sum_update)
+        if not self._detector_sum_jobs:
+            self.detector_sum_calculate_button.setEnabled(True)
+            self.roi_sum_calculate_button.setEnabled(True)
+        if self._operation_cancel_requested:
+            self._operation_stopped()
 
-    @qt.Slot(object, int)
-    def _detector_sum_finished(self, values, generation):
+    @qt.Slot(int, object, object, int)
+    def _detector_sum_progress(self, index, value, roi_value, generation):
         if generation != self._detector_sum_generation:
             return
-        detector_values, roi_values = values
-        self._detector_sum_values = np.asarray(detector_values, dtype=np.int64)
-        self._roi_sum_values = np.asarray(roi_values, dtype=np.int64)
-        self._detector_sum_valid = True
-        x = np.arange(1, self._detector_sum_values.size + 1, dtype=np.float64)
-        self.detector_sum_plot.clear()
-        if x.size:
-            self.detector_sum_plot.addCurve(
-                x,
-                self._detector_sum_values,
-                legend="Detector sum intensity",
-                symbol="o",
-                resetzoom=True,
+        label = "ROI sum" if self._sum_calculation_mode == "roi" else "detector sum"
+        self.status_label.setText(
+            f"Calculating {label}: {index + 1}/{len(self.image_paths)}"
+        )
+        self._update_export_progress_block(
+            "operation", f"Calculating {label}",
+            f"frame [{index + 1}/{len(self.image_paths)}]",
+        )
+
+    @qt.Slot(object, int)
+    def _detector_sum_finished(self, result, generation):
+        if generation != self._detector_sum_generation:
+            return
+        mode = result["mode"]
+        values = np.asarray(result["values"], dtype=np.int64)
+        x = np.arange(1, values.size + 1, dtype=np.float64)
+        if mode == "detector":
+            self._detector_sum_values = values
+            self._detector_sum_by_source = {
+                (os.path.abspath(source.path), source.frame): int(value)
+                for source, value in zip(self._sum_job_sources, values)
+            }
+            self._detector_sum_valid = True
+            plot = self.detector_sum_plot
+            legend = "Detector sum intensity"
+        else:
+            self._roi_sum_values = values
+            self._roi_sum_valid = True
+            plot = self.roi_sum_plot
+            legend = "ROI sum intensity"
+        plot.clear()
+        if values.size:
+            plot.addCurve(
+                x, values, legend=legend, symbol="o", resetzoom=True,
             )
-        self.detector_sum_plot.setGraphXLabel("Image / frame index")
-        self.detector_sum_plot.setGraphYLabel("Detector sum intensity")
-        self.roi_sum_plot.clear()
-        if self._roi_sum_values.size:
-            self.roi_sum_plot.addCurve(
-                x, self._roi_sum_values, legend="ROI sum intensity",
-                symbol="o", resetzoom=True,
-            )
-        self.roi_sum_plot.setGraphXLabel("Image / frame index")
-        self.roi_sum_plot.setGraphYLabel("ROI sum intensity")
+        plot.setGraphXLabel("Image / frame index")
+        plot.setGraphYLabel(legend)
+        self.status_label.setText(
+            f"{legend} calculation complete: {values.size} frames"
+        )
+        self._update_export_progress_block(
+            "operation", legend, f"complete [{values.size}/{values.size}]"
+        )
         self._update_source_sum_label()
-        if self._integration_waiting_for_detector_sum:
-            self._integration_waiting_for_detector_sum = False
-            qt.QTimer.singleShot(0, self.start_integration)
 
     @qt.Slot(str, int)
     def _detector_sum_failed(self, details, generation):
         if generation != self._detector_sum_generation:
             return
-        self.detector_sum_plot.clear()
         self._update_source_sum_label()
+        label = "ROI Sum" if self._sum_calculation_mode == "roi" else "Detector Sum"
         self.status_label.setText(
-            "Detector sum calculation failed; see error dialog"
+            f"{label} calculation failed; see error dialog"
         )
-        self._integration_waiting_for_detector_sum = False
-        self.show_error("Detector Sum Failed", details)
+        self.show_error(f"{label} Failed", details)
 
     def _start_detector_mask_update(self):
         """Calculate pyFAI's dynamic detector mask without blocking the GUI."""
@@ -2185,7 +2439,9 @@ class MainWindow(qt.QMainWindow):
         if self.integrator is None or self.image_data is None:
             self._update_source_sum_label()
             return
-        self.source_sum_label.setText("Detector sum intensity: calculating...")
+        # Detector-mask preparation is independent of Detector Sum. Preserve an
+        # existing cached reading (or "not calculated") while the mask is built.
+        self._update_source_sum_label()
         shape_key = tuple(self.image_data.shape)
         detector_mask_is_static = getattr(self.integrator.detector, "dummy", None) is None
         if detector_mask_is_static and shape_key in self._detector_mask_cache:
@@ -2198,7 +2454,9 @@ class MainWindow(qt.QMainWindow):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._detector_mask_finished)
+        worker.cancelled.connect(thread.quit)
         worker.finished.connect(thread.quit)
+        worker.cancelled.connect(worker.deleteLater)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         job = (thread, worker)
@@ -2211,6 +2469,9 @@ class MainWindow(qt.QMainWindow):
     def _remove_mask_job(self, job):
         if job in self._mask_jobs:
             self._mask_jobs.remove(job)
+        self._update_navigation_buttons()
+        if self._operation_cancel_requested:
+            self._operation_stopped()
 
     @qt.Slot(object, int, str)
     def _detector_mask_finished(self, mask, generation, error):
@@ -2238,6 +2499,7 @@ class MainWindow(qt.QMainWindow):
             self.status_label.setText(
                 f"{self._image_position_text()}; detector mask excludes {count:,} pixels"
             )
+        self._update_navigation_buttons()
         if self._pending_auto_integration and self.integrator is not None:
             self._pending_auto_integration = False
             self.start_integration()
@@ -2261,6 +2523,8 @@ class MainWindow(qt.QMainWindow):
 
     @qt.Slot()
     def choose_image(self):
+        if self._has_active_operation():
+            return
         filenames, _ = qt.QFileDialog.getOpenFileNames(
             self, "Select 2-D Diffraction Images", self.input_path, IMAGE_FILTER
         )
@@ -2270,32 +2534,75 @@ class MainWindow(qt.QMainWindow):
         for reader in self._image_readers.values():
             reader.close()
         self._image_readers.clear()
-        try:
-            sources = []
-            for filename in filenames:
-                sources.extend(expand_image_file(filename))
-        except Exception as exc:
-            self.show_error("Unable to Read Image Frames", str(exc))
+        self._operation_cancel_requested = False
+        self._load_thread = qt.QThread(self)
+        self._load_worker = ImageLoadWorker(filenames)
+        self._load_worker.moveToThread(self._load_thread)
+        self._load_thread.started.connect(self._load_worker.run)
+        self._load_worker.progress.connect(self._image_load_progress)
+        self._load_worker.finished.connect(self._image_load_finished)
+        self._load_worker.failed.connect(self._image_load_failed)
+        self._load_worker.cancelled.connect(self._load_thread.quit)
+        self._load_worker.finished.connect(self._load_thread.quit)
+        self._load_worker.failed.connect(self._load_thread.quit)
+        self._load_worker.finished.connect(self._load_worker.deleteLater)
+        self._load_worker.failed.connect(self._load_worker.deleteLater)
+        self._load_worker.cancelled.connect(self._load_worker.deleteLater)
+        self._load_thread.finished.connect(self._image_load_thread_finished)
+        self._load_thread.finished.connect(self._load_thread.deleteLater)
+        self.status_label.setText("Loading selected images…")
+        self._update_export_progress_block(
+            "operation", "Loading images", f"starting [0/{len(filenames)}]"
+        )
+        self._update_navigation_buttons()
+        self._load_thread.start()
+
+    @qt.Slot(int, int, str)
+    def _image_load_progress(self, current, total, filename):
+        self.status_label.setText(f"Loading {current} of {total}: {filename}")
+        self._update_export_progress_block(
+            "operation", "Loading images", f"file [{current}/{total}] {filename}"
+        )
+
+    @qt.Slot(object)
+    def _image_load_finished(self, sources):
+        if self._operation_cancel_requested:
             return
         self.image_paths = sources
         self._cake_cache.clear()
-        self._invalidate_detector_sum()
+        self._invalidate_detector_sum(clear=True)
         self.image_index = 0
         self._load_current_image()
+        self._update_export_progress_block(
+            "operation", "Loading images", f"complete ({len(sources)} images/frames)"
+        )
+
+    @qt.Slot(str)
+    def _image_load_failed(self, details):
+        if not self._operation_cancel_requested:
+            self.show_error("Unable to Read Image Frames", details)
+            self.status_label.setText("Loading images failed")
+            self._update_export_progress_block(
+                "operation", "Loading images", "failed"
+            )
+
+    @qt.Slot()
+    def _image_load_thread_finished(self):
+        self._load_worker = None
+        self._load_thread = None
+        if self._operation_cancel_requested:
+            self._operation_stopped()
+        else:
+            self._update_navigation_buttons()
 
     def _load_current_image(self):
         if not (0 <= self.image_index < len(self.image_paths)):
             return
         source = self.image_paths[self.image_index]
         try:
-            if source.frame is not None:
-                reader = self._image_readers.get(source.path)
-                if reader is None:
-                    reader = fabio.open(source.path)
-                    self._image_readers[source.path] = reader
-                data = np.asarray(reader.getframe(source.frame).data).copy()
-            else:
-                data = read_image(source)
+            # Keep only the current detector array in memory. read_image opens
+            # and closes the file (or HDF5 frame) within this call.
+            data = read_image(source)
             require_integer_detector_image(data, source.title)
         except Exception as exc:
             self.show_error("Unable to Read Image", str(exc))
@@ -2479,7 +2786,7 @@ class MainWindow(qt.QMainWindow):
             reference_description += f" [{len(reference_sources)} frames]"
         getattr(self, f"{kind}_edit").setText(reference_description)
         self.status_label.setText(
-            f"{kind.title()} image loaded; select Show or click Start Integration"
+            f"{kind.title()} image loaded; select Show or click Integrate"
         )
 
     @qt.Slot()
@@ -2606,22 +2913,18 @@ class MainWindow(qt.QMainWindow):
                     self._reference_curve_cache.get(cache_key),
                 ))
 
-        # On the first integration, finish the all-frame file scan before
-        # starting pyFAI. This avoids concurrent HDF5/pyFAI work competing with
-        # Background/Empty integration. Later integrations reuse the sum cache.
-        if not self._detector_sum_valid:
-            self._integration_waiting_for_detector_sum = True
-            self.status_label.setText(
-                "Calculating detector sums before integration..."
-            )
-            self._start_detector_sum_update()
-            return
-
         self.integrate_button.setEnabled(False)
         self._auto_integrate_images = True
         self.status_label.setText("Integrating…")
+        self._operation_cancel_requested = False
+        self._update_export_progress_block(
+            "operation", "Integration", "running…"
+        )
         self._thread = qt.QThread(self)
         cake_cache_key = self._cake_cache_key(radial_range, azimuth_range)
+        # IntegrationWorker performs pyFAI 1-D integration and optional Cake /
+        # reference work only. Detector Sum and ROI Sum are never calculated
+        # here; their cached values are produced exclusively by Calculate.
         self._worker = IntegrationWorker(
             self.image_data, self.integrator, self._effective_mask(),
             self.points_spin.value(), self.unit_combo.currentText(), radial_range,
@@ -2634,12 +2937,18 @@ class MainWindow(qt.QMainWindow):
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
-        self._worker.finished.connect(self.integration_finished)
-        self._worker.failed.connect(self.integration_failed)
+        self._worker.finished.connect(self._integration_worker_succeeded)
+        self._worker.failed.connect(self._integration_worker_failed)
+        self._worker.cancelled.connect(self._thread.quit)
         self._worker.finished.connect(self._thread.quit)
         self._worker.failed.connect(self._thread.quit)
-        self._thread.finished.connect(self._worker.deleteLater)
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._worker.failed.connect(self._worker.deleteLater)
+        self._worker.cancelled.connect(self._worker.deleteLater)
+        self._thread.finished.connect(self._integration_thread_finished)
         self._thread.finished.connect(self._thread.deleteLater)
+        self._integration_worker_payload = None
+        self._integration_worker_error = None
         self._update_navigation_buttons()
         self._thread.start()
 
@@ -2679,10 +2988,13 @@ class MainWindow(qt.QMainWindow):
     def _grab_combined_plots(self):
         """Capture exactly the visible plot canvases, without GUI controls."""
         source = self.image_plot.getWidgetHandle().grab().toImage()
-        if self.right_stack.currentWidget() in (
-            self.detector_sum_plot, self.roi_sum_plot
-        ):
-            right = self.right_stack.currentWidget().getWidgetHandle().grab().toImage()
+        current = self.right_stack.currentWidget()
+        if current in (self.detector_sum_container, self.roi_sum_container):
+            plot = (
+                self.detector_sum_plot
+                if current is self.detector_sum_container else self.roi_sum_plot
+            )
+            right = plot.getWidgetHandle().grab().toImage()
             height = max(source.height(), right.height())
             combined = qt.QImage(
                 source.width() + right.width(), height, qt.QImage.Format_RGB888
@@ -2775,6 +3087,18 @@ class MainWindow(qt.QMainWindow):
     def _start_ascii_export(self, output_dir, reset_progress=True):
         """Start the existing batch ASCII writer in a chosen directory."""
 
+        poni = self.poni_edit.text().strip()
+        if not poni or not os.path.isfile(poni):
+            self.show_error(
+                "PONI File Required",
+                "Load a valid PONI file before exporting integrated data.",
+            )
+            return
+        try:
+            radial_range, azimuth_range = self._integration_ranges()
+        except ValueError as exc:
+            self.show_error("Invalid Parameters", str(exc))
+            return
         if reset_progress:
             self._reset_export_progress()
         self._append_export_progress("Integrated data:")
@@ -2801,12 +3125,18 @@ class MainWindow(qt.QMainWindow):
         self._batch_worker.moveToThread(self._batch_thread)
         self._batch_thread.started.connect(self._batch_worker.run)
         self._batch_worker.progress.connect(self._batch_data_progress)
-        self._batch_worker.finished.connect(self._batch_data_finished)
-        self._batch_worker.failed.connect(self._batch_data_failed)
+        self._batch_worker.finished.connect(self._batch_worker_succeeded)
+        self._batch_worker.failed.connect(self._batch_worker_failed)
+        self._batch_worker.cancelled.connect(self._batch_thread.quit)
         self._batch_worker.finished.connect(self._batch_thread.quit)
         self._batch_worker.failed.connect(self._batch_thread.quit)
-        self._batch_thread.finished.connect(self._batch_worker.deleteLater)
+        self._batch_worker.finished.connect(self._batch_worker.deleteLater)
+        self._batch_worker.failed.connect(self._batch_worker.deleteLater)
+        self._batch_worker.cancelled.connect(self._batch_worker.deleteLater)
+        self._batch_thread.finished.connect(self._batch_thread_finished)
         self._batch_thread.finished.connect(self._batch_thread.deleteLater)
+        self._batch_worker_result = None
+        self._batch_worker_error = None
         self.integrate_button.setEnabled(False)
         self.save_current_action.setEnabled(False)
         self.save_batch_video_action.setEnabled(False)
@@ -2814,6 +3144,10 @@ class MainWindow(qt.QMainWindow):
         self.save_ascii_video_action.setEnabled(False)
         self._update_navigation_buttons()
         self.status_label.setText("Exporting integrated ASCII data...")
+        self._operation_cancel_requested = False
+        self._update_export_progress_block(
+            "operation", "Export", "starting…"
+        )
         self._batch_thread.start()
 
     @qt.Slot(int, int, str)
@@ -2824,8 +3158,37 @@ class MainWindow(qt.QMainWindow):
         )
 
     @qt.Slot(str, int)
+    def _batch_worker_succeeded(self, output_dir, count):
+        """Store the result; continue only after QThread has fully stopped."""
+        self._batch_worker_result = (output_dir, count)
+
+    @qt.Slot(str)
+    def _batch_worker_failed(self, details):
+        """Store the error; report it only after QThread has fully stopped."""
+        self._batch_worker_error = details
+
+    @qt.Slot()
+    def _batch_thread_finished(self):
+        result = self._batch_worker_result
+        error = self._batch_worker_error
+        self._batch_worker_result = None
+        self._batch_worker_error = None
+        self._batch_worker = None
+        self._batch_thread = None
+        if self._operation_cancel_requested:
+            self._operation_stopped()
+            return
+        if error is not None:
+            self._batch_data_failed(error)
+        elif result is not None:
+            # Run the next GUI/video stage on a fresh event-loop turn. This
+            # also lets deferred HDF5/Fabio destruction complete on Windows.
+            qt.QTimer.singleShot(
+                0, lambda result=result: self._batch_data_finished(*result)
+            )
+
+    @qt.Slot(str, int)
     def _batch_data_finished(self, output_dir, count):
-        self._batch_worker = self._batch_thread = None
         if self._combined_export_plot_path is not None:
             plot_path = self._combined_export_plot_path
             self._combined_export_plot_path = None
@@ -2861,7 +3224,6 @@ class MainWindow(qt.QMainWindow):
 
     @qt.Slot(str)
     def _batch_data_failed(self, details):
-        self._batch_worker = self._batch_thread = None
         self._combined_export_video_dir = None
         self._combined_export_plot_path = None
         self.integrate_button.setEnabled(True)
@@ -3052,7 +3414,7 @@ class MainWindow(qt.QMainWindow):
         else:
             self._finish_video_export(True)
 
-    def _finish_video_export(self, success, error=""):
+    def _finish_video_export(self, success, error="", cancelled=False):
         writer, self._video_writer = self._video_writer, None
         if writer is not None:
             writer.close()
@@ -3088,9 +3450,39 @@ class MainWindow(qt.QMainWindow):
             self.status_label.setText(
                 "Batch videos saved" if batch_mode else f"Saved video to {path}"
             )
-        else:
+        elif not cancelled:
             self.show_error("Video Export Failed", error)
         self._update_navigation_buttons()
+        if cancelled:
+            self._operation_stopped()
+
+    @qt.Slot(object)
+    def _integration_worker_succeeded(self, payload):
+        self._integration_worker_payload = payload
+
+    @qt.Slot(str)
+    def _integration_worker_failed(self, details):
+        self._integration_worker_error = details
+
+    @qt.Slot()
+    def _integration_thread_finished(self):
+        payload = self._integration_worker_payload
+        error = self._integration_worker_error
+        self._integration_worker_payload = None
+        self._integration_worker_error = None
+        self._worker = None
+        self._thread = None
+        if self._operation_cancel_requested:
+            self._operation_stopped()
+            return
+        if error is not None:
+            qt.QTimer.singleShot(
+                0, lambda error=error: self.integration_failed(error)
+            )
+        elif payload is not None:
+            qt.QTimer.singleShot(
+                0, lambda payload=payload: self.integration_finished(payload)
+            )
 
     @qt.Slot(object)
     def integration_finished(self, payload):
@@ -3108,7 +3500,9 @@ class MainWindow(qt.QMainWindow):
         radial = payload["radial"]
         self.integrate_button.setEnabled(True)
         self.status_label.setText(f"Integration complete: {len(radial):,} data points")
-        self._worker = self._thread = None
+        self._update_export_progress_block(
+            "operation", "Integration", f"complete ({len(radial):,} points)"
+        )
         self._update_navigation_buttons()
         if self._exporting_video:
             qt.QTimer.singleShot(0, self._append_video_frame)
@@ -3280,7 +3674,6 @@ class MainWindow(qt.QMainWindow):
     @qt.Slot(str)
     def integration_failed(self, details):
         self.integrate_button.setEnabled(True)
-        self._worker = self._thread = None
         self._update_navigation_buttons()
         if self._exporting_video:
             self._finish_video_export(False, details)
