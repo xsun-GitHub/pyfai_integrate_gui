@@ -1,69 +1,24 @@
 # pyFAI Integrate Viewer
 
-A PyQt/silx desktop GUI for viewing two-dimensional diffraction data and
-performing one-dimensional azimuthal integration with pyFAI.
+A PyQt/silx GUI for viewing 2-D diffraction images and performing 1-D
+azimuthal integration with pyFAI. This project contains three generations; a
+later version includes the applicable features of the versions before it.
 
-## Features
+## Versions
 
-- Opens one or multiple EDF, CBF, TIFF, IMG, MarCCD, HDF5, or NumPy images.
-- Expands multi-frame HDF5 files and navigates frames with Previous/Next.
-- Loads PONI geometry and displays detector, pixel, distance, and wavelength data.
-- Applies detector dead areas/module gaps and an optional user Mask.
-- Requires raw Data, Empty, and Background detector intensities to use an
-  integer NumPy dtype; non-integer detector images are rejected with an error.
-- Displays the current frame's total intensity after detector and user masks,
-  using masked pixels as zero and an int64 accumulator.
-- Provides a Detector Sum tab plotting the masked detector sum for every
-  selected image/frame against its sequence index.
-- Calculates the all-frame Detector Sum only when its **Calculate** button is
-  clicked; normal integration does not calculate Detector Sum.
-- Recomputes detector dummy-pixel masks per frame while safely caching static masks.
-- Displays masks as a pink overlay on a `viridis` detector image.
-- Integrates in a worker thread and reuses pyFAI/HDF5 caches for better performance.
-- Caches the combined detector/user Mask instead of rebuilding it on cursor movement.
-- Reuses unchanged Empty/Background 1-D integrations for Update, video, and ASCII export.
-- Supports integration units, point count, radial range, Log X, and Log Y.
-- Loads optional Empty and Background images with format validation.
-- Reuses a single-frame Empty/Background for every data frame, or matches
-  multi-frame references frame-by-frame when their frame counts are equal.
-- Rejects multi-frame Data/Empty/Background combinations with unequal frame counts.
-- Displays `Data`, scaled `Empty`/`Background`, and `Subtracted data` curves.
-- Optionally calculates and displays a pyFAI azimuthal-versus-radial Cake plot above the 1-D plot; it is disabled by default, calculated after all 1-D work, and cached once per source image.
-- Uses logarithmic Viridis intensity mapping by default for Source and Cake images; Cake provides the same native silx colormap tool as Source without recalculating integration.
-- Applies independent Empty/Background subtraction factors.
-- Saves the currently visible plot canvases, grouped batch MP4 videos, and ASCII `.dat` data.
-- Provides **Data and Plots**: one source exports its ASCII data and current
-  plot, while multiple images/frames export all ASCII data and grouped videos.
-- Provides separate persistent Input and Export paths under **File > Path**;
-  Input applies to Image/Empty/Background and Export applies to all saves.
-- ASCII export includes reference filenames, factors, and reference/subtracted columns.
-- **Options > Plot NeXus** first opens one NeXus/HDF5 file, then provides one
-  silx file tree where selected numeric 1-D datasets can be assigned with
-  **Set as X** and **Set as Y**. The selected dataset's index and raw values
-  appear in a scrollable table below the tree. The X/Y data are plotted when
-  their lengths match, with editable axis names. The resulting plot window has
-  a checkable **Derivative** option in the native plot toolbar that adds or
-  removes a `dY/dX` curve. Rectangle zoom is not constrained to the data bounds.
-- **Options > Plot ASCII** selects the X and Y columns from a whitespace-,
-  tab-, or comma-separated numeric table. A matching comment/header line
-  immediately above the data is shown beside its corresponding column.
-- Uses a low-memory display preview while integrating full-resolution data.
+| Version | Program | Main additions |
+| --- | --- | --- |
+| Original | `pyfai_integrate_gui.py` | Standard integration, subtraction, plots, and export |
+| v2 | `pyfai_integrate_gui_v2.py` | ROI Sum, unified Status, Stop, and improved caching |
+| v3 | `pyfai_integrate_gui_v3.py` | p62 NeXus modes and integrated PyAnomScat ASAXS analysis |
 
-## Requirements
+The original and v2 programs remain available independently.
 
-- Python 3.10 or newer
-- NumPy
-- PyQt6
-- pyFAI
-- silx
-- Fabio
-- h5py
-- qtawesome
-- imageio and imageio-ffmpeg (for MP4 export)
+## Requirements and installation
 
-## Installation
-
-Create and activate a virtual environment, then install the dependencies:
+Python 3.10 or newer is recommended. Core dependencies are NumPy, PyQt6,
+pyFAI, silx, Fabio, h5py, qtawesome, imageio, and imageio-ffmpeg. The v3 ASAXS
+window additionally uses pyqtgraph, scanf, and xraydb.
 
 ```powershell
 python -m venv .venv
@@ -71,100 +26,61 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
-## Running the Application
-
-Run the standard version:
+Run the required generation:
 
 ```powershell
 python pyfai_integrate_gui.py
-```
-
-Run version 2 with rectangular ROI analysis:
-
-```powershell
 python pyfai_integrate_gui_v2.py
+python pyfai_integrate_gui_v3.py
 ```
 
-## Version 2: ROI Sum
+## Original application
 
-`pyfai_integrate_gui_v2.py` contains all standard-version features and adds a
-rectangular ROI workflow:
+### Main functions
 
-- **Select ROI** is available in the Source image toolbar. Click it and drag a
-  rectangle over the required detector area. Drawing a new rectangle replaces
-  the previous ROI.
-- **ROI Sum** appears beside **Integration** and **Detector Sum** in the top
-  menu-bar row and has its own **Calculate** button.
-- The ROI Sum X axis is the sequence index of every selected image/frame. Its Y
-  axis is the total integer detector intensity inside the selected ROI for the
-  corresponding frame.
-- Detector-mask and user-mask pixels inside the ROI contribute zero.
-- ROI coordinates refer to the full-resolution detector data, even when the
-  displayed Source preview is downsampled.
-- Detector Sum and ROI Sum are independent and run only from their respective
-  **Calculate** buttons. **Integrate** never calculates either series.
-- ROI Sum reports an error if no rectangle is selected. Detector-mask and
-  user-mask pixels contribute zero to both calculations.
-- Existing Detector/ROI curves remain visible during recalculation, after Stop,
-  and after ROI, PONI, or Mask changes. Both are cleared only when a new Image
-  selection replaces the current image list.
-- The value below Source displays a cached Detector Sum for the current frame,
-  or `not calculated`; it never performs a hidden sum during **Integrate**.
-- Version 2 renames **Start Integration** to **Integrate**, adds **Stop**, and
-  replaces Export Progress with a unified **Status** panel for loading,
-  integration, Sum calculations, and exports. Integrate is disabled while data
-  is loading.
-- Stop cancels at safe file/frame boundaries. A pyFAI call already running is
-  allowed to return safely, but its result is discarded.
-- When **ROI Sum** is the selected view, plot and video export include Source
-  plus the ROI Sum plot.
+- Opens one or multiple EDF, CBF, TIFF, IMG, MarCCD, HDF5, or NumPy images and
+  expands multi-frame files.
+- Loads PONI geometry and displays detector, pixel, distance, and wavelength
+  information.
+- Applies detector dead areas/module gaps and an optional user mask.
+- Integrates full-resolution data while using a lower-memory display preview.
+- Supports integration units, point count, radial/azimuthal ranges, Log X, and
+  Log Y.
+- Loads optional Empty and Background images with independent display,
+  subtraction, and factor settings.
+- Displays Data, Empty, Background, and Subtracted curves.
+- Calculates a masked detector intensity sum using an `int64` accumulator.
+- Optionally displays a pyFAI azimuthal-versus-radial Cake plot.
+- Saves current plots, tab-separated ASCII data, and grouped MP4 videos.
+- Keeps separate persistent Input and Export paths under **File -> Path**.
+- **Options -> Plot NeXus** browses numeric datasets, assigns X/Y, plots
+  matching arrays, and optionally displays `dY/dX`.
+- **Options -> Plot ASCII** selects X/Y columns from common numeric text files.
 
-The standard `pyfai_integrate_gui.py` remains available without ROI controls.
+Raw Data, Empty, and Background detector intensities must use a supported
+integer NumPy type. Invalid shapes and data types are reported to the user.
 
-## Usage
+### Standard workflow
 
-1. Click **Browse** next to **Image** and select one or more diffraction files.
-   Multi-frame HDF5 files are expanded automatically.
-2. Load the matching **PONI** geometry and optionally load a **Mask**.
-3. Set the number of points and X-axis unit. The optional **Radial range** uses
-   the selected X-axis unit; the optional **Azimuthal range** uses degrees.
-   Enter a range in one field as `minimum, maximum`, or leave it blank at
-   **Auto** to use the full range.
-4. Optionally load **Empty** and/or **Background** reference images. Their shape
-   and data type must match the sample image. A single-frame reference is reused
-   for all data frames. A multi-frame reference is matched frame-by-frame and
-   must have the same frame count as each multi-frame data file.
-5. Click **Start Integration** in the standard version. Detector Sum is a
-   separate operation: open its tab and click **Calculate** when needed.
-6. Use **Show** to immediately show/hide a reference curve. Set **Subtract** and
-   **Factor**, then click **Update** to recalculate the subtracted result.
-7. Use **Previous/Next** to navigate selected files or HDF5 frames.
-   The value below Source shows the current masked detector sum; open the
-   **Detector Sum** tab to compare this value across all selected frames.
-8. Use **File > Save** to export:
-   - **Plot (current view)**: source and 1-D plots, plus Cake when it is visible.
-   - **Batch Video**: one sorted MP4 per filename-prefix group using the same currently visible plots.
-   - **ASCII (all integrated data)**: one `.dat` file per image/frame.
+1. Select one or more diffraction files using **Image**.
+2. Load the corresponding **PONI** geometry and optionally a **Mask**.
+3. Configure the number of points, integration unit, and optional ranges.
+4. Optionally select Empty/Background data and configure **Show**, **Subtract**,
+   and **Factor**.
+5. Start integration and navigate files/frames with **Previous/Next**.
+6. Export the current plot, all ASCII data, grouped video, or Data and Plots.
 
-The image title shows the source filename. Display downsampling does not affect
-the integration because pyFAI always receives the full-resolution detector data.
+A single-frame reference is reused for every data frame. In the original
+application, a multi-frame reference is paired frame-by-frame and must have the
+same frame count as the sample.
 
-## Exported ASCII Data Format
+### ASCII output
 
-**ASCII (all integrated data)** creates one tab-separated `.dat` file for each
-source image or HDF5 frame. Numeric values use scientific notation with ten
-digits after the decimal point. Lines beginning with `#` are comments. The last
-comment line contains the column names. Without an Empty or Background image,
-the file contains two columns: the selected radial coordinate (for example
-`q_A^-1`) and `Intensity`. When references are loaded, preceding comment lines
-record each reference filename and factor, and the columns are ordered as the
-radial coordinate, `Intensity`, `Subtracted`, `Empty`, and `Background`, omitting
-any reference that was not loaded. `Empty` and `Background` contain the scaled
-reference intensities (`factor × integrated reference`). `Subtracted` contains
-the sample intensity minus each scaled reference whose **Subtract** option was
-selected. All rows share the same radial bins and selected integration unit.
-
-Example:
+One `.dat` file is saved for each image/frame. Comment lines begin with `#` and
+record metadata, filenames, factors, and column names. Depending on the loaded
+references, columns include the radial coordinate, `Intensity`, `Subtracted`,
+`Empty`, and `Background`. Reference columns contain scaled intensities;
+`Subtracted` removes every reference whose **Subtract** option is selected.
 
 ```text
 # Empty file: empty.tif; factor: 1.00
@@ -172,3 +88,149 @@ Example:
 # q_A^-1    Intensity    Subtracted    Empty    Background
 1.0000000000e-03    2.5000000000e+04    2.4100000000e+04    7.0000000000e+02    2.0000000000e+02
 ```
+
+## Version 2 additions
+
+v2 preserves the original integration workflow and adds the features below.
+
+### Detector Sum and ROI Sum
+
+- Detector Sum runs only from its own **Calculate** button; **Integrate** never
+  calculates it implicitly.
+- The Source label displays a cached value for the current frame or
+  `not calculated`.
+- **Select ROI** in the Source toolbar draws a rectangular detector region.
+  Drawing a new rectangle replaces the previous ROI.
+- ROI Sum calculates masked integer intensity inside the ROI for every selected
+  image/frame. Missing or invalid ROI selection produces a clear error.
+- Detector and user-mask pixels contribute zero. ROI coordinates always refer
+  to the full-resolution detector image.
+- Detector Sum and ROI Sum remain independent and retain completed curves
+  during recalculation, after Stop, and after ROI/PONI/Mask changes. Selecting
+  a new image list clears both caches.
+
+### Status, Stop, caching, and export
+
+- **Start Integration** becomes **Integrate**.
+- A unified **Status** area reports loading, integration, sum calculations, and
+  exports. Integrate is disabled while required input is loading.
+- **Stop** cancels at safe file/frame boundaries. An active pyFAI call is
+  allowed to return safely and its result is discarded.
+- Compatible Cake data, combined masks, reference integrations, and static
+  detector masks are reused. Dynamic dummy-pixel masks are recalculated per
+  frame.
+- **Save -> Data and Plots** writes one `.dat` per image/frame. A one-frame
+  filename group produces a PNG; a multi-frame group uses grouped MP4 export.
+  The selected Integration, Detector Sum, or ROI Sum view is included, together
+  with Cake when enabled.
+
+## Version 3 additions
+
+v3 preserves v2 and adds direct p62 NeXus loading, energy-aware reference
+matching, multi-curve ASCII plotting, and integrated ASAXS analysis.
+
+### p62 beamline modes
+
+Choose **File -> Beamline -> p62**. Four buttons appear above **Input files**:
+
+| Mode | Image dataset | Energy/wavelength behaviour |
+| --- | --- | --- |
+| SAXS | `/scan/data/saxs_raw` | PONI wavelength remains unchanged |
+| WAXS | `/scan/data/waxs_raw` | PONI wavelength remains unchanged |
+| ASAXS | `/scan/data/saxs_raw` | Energy is read and wavelength is updated per image |
+| AWAXS | `/scan/data/waxs_raw` | Energy is read and wavelength is updated per image |
+
+Energy comes from `/scan/data/energy` as `float64`, is validated as finite and
+positive, and may be displayed as integer eV. ASAXS/AWAXS calculate wavelength
+in metres using `lambda = hc/E` and assign it to the integrator for the
+corresponding 2-D image. The PONI file on disk is never overwritten.
+
+The image count may be an integer multiple of the energy count. Energies are
+then assigned to consecutive image groups: 18 images and 6 energy values means
+3 images per energy. Incompatible dimensions produce an input error.
+
+### p62 Empty and Background subtraction
+
+Empty and Background accept one or multiple `.nxs` files. SAXS/ASAXS use
+`/scan/data/saxs_raw`; WAXS/AWAXS use `/scan/data/waxs_raw`.
+
+- One reference image is integrated once and reused for all sample images.
+- If sample and reference totals are equal, frames are paired in order and
+  their energies must match.
+- If totals differ, references are matched by energy. Repeated sample images at
+  one energy reuse that energy's reference integration.
+- Multi-energy reference data must contain compatible energy values.
+- If q ranges differ, subtraction uses the common q interval and interpolates
+  the reference onto the sample q points.
+
+### Status, saving, and memory
+
+The fixed Status section shows overall saving progress, file-series progress,
+frame progress, and only the enabled Empty/Background subtraction sources. The
+scrolling section shows filenames only. Cake data is saved only when Cake is
+selected. Video export integrates and writes one frame at a time, then releases
+the frame payload and Cake cache to reduce peak memory use.
+
+### ASAXS ASCII output
+
+ASAXS/AWAXS filenames include energy using `_E<energy>`:
+
+```text
+sample_frame_0001_E12000.dat
+```
+
+The ASCII header also records energy and wavelength. PyAnomScat can therefore
+recover energy from the header when the filename does not use the preferred
+form.
+
+### Integrated PyAnomScat window
+
+Choose **Options -> ASAXS...** to open the PyAnomScat Stuhrmann-method GUI as a
+child window. **Import ASCII** starts in the main application's current Input
+path. v3 loads only these local project resources and does not call the original
+external ASAXS directory:
+
+- `pyAnomScat_stuhrmann_method_v3.py`
+- `pyAnomScat_stuhrmann_method.ui`
+
+The `.ui` file defines the PyAnomScat window layout and is required. The old
+bundled example `data/` directory and dark `StyleSheet/` are not needed by the
+integrated workflow and have been removed. PyAnomScat uses the normal light
+application palette. **Import ASCII** is available from the File menu; redundant
+Quit controls were removed because the window's close button has the same role.
+The legacy, unimplemented **Import HDF/Nexus** entry is also located in File and
+remains disabled rather than incorrectly treating HDF data as ASCII. The first
+Control Panel row contains Element, anomalous-factor, monochromator-shift, and
+chemical-shift controls from left to right; the second row contains Stuhrmann
+and Export. Table columns use practical defaults matching the compact data view
+and remain manually resizable from the header. The Color table column is hidden;
+**Plot -> Color** selects either the original default color list or Origin
+Color4Line and immediately recolors loaded curves. New imports inherit the
+current mono/chemical shifts, plots automatically scale both axes, and curve
+export proposes the first imported filename by default.
+
+The anomalous-factor operation checks the imported energies against the xraydb
+range and displays a warning for missing, invalid, or unsupported values instead
+of raising `ValueError: max() iterable argument is empty`. **Element** opens an
+interactive periodic table; selecting a symbol updates both its symbol and
+atomic number in the main ASAXS window. The Control Panel table includes a
+clickable **Del** column and supports row drag-and-drop while keeping curve and
+energy data aligned. Imported locations are split at the final path separator:
+**Path** displays the directory and **File name** displays only the `.dat`
+filename. All PyAnomScat plots use a light background; the input
+curve plot and Stuhrmann-result plot include legends.
+
+When importing a curve, PyAnomScat reads the comment immediately above the
+first numeric row. A first column named `q_A^-1` changes the input and result X
+axes to `A^-1`; `q_nm^-1` keeps `nm^-1`. Curve export adds the first two fields
+of that source comment (for example `# q_A^-1 Intensity`) to its header.
+
+### Multi-file Plot ASCII
+
+**Options -> Plot ASCII** uses one mode for both single- and multi-file input.
+Multiple curves can be loaded together, and every curve can be shown or hidden
+independently in an Origin-like curve list. **Log X** and **Log Y** above the
+plot are provided with the other plot-toolbar buttons and independently switch
+either axis between linear and logarithmic scale. The right-side curve list
+shows a color/line-style sample beside every filename; no separate legend is
+drawn over or beside the plot.

@@ -7,3 +7,8 @@ h5py
 qtawesome
 imageio
 imageio-ffmpeg
+
+# Integrated Options -> ASAXS (PyAnomScat) window
+pyqtgraph
+scanf
+xraydb

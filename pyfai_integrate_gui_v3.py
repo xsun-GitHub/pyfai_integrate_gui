@@ -1,4 +1,4 @@
-"""pyFAI Integrate Viewer v2 with rectangular per-frame ROI sums.
+"""pyFAI Integrate Viewer v3 with p62 beamline/ASAXS support.
 
 Features
 --------
@@ -27,6 +27,19 @@ Version 2 additions
 - Lower-memory previews, Cython Cake histogram integration, and reusable mask,
   reference, Cake, and detector-sum caches.
 
+Version 3 additions
+-------------------
+- ``File > Beamline > p62`` with SAXS, WAXS, ASAXS, and AWAXS NeXus modes.
+- Direct ``/scan/data/saxs_raw`` or ``/scan/data/waxs_raw`` image-stack reads.
+- Per-energy wavelength updates for anomalous modes using
+  ``/scan/data/energy`` and ``wavelength = hc / energy``.
+- Single shared or energy-matched Empty/Background subtraction, including
+  common-q interpolation and one-to-one matching for equal-length series.
+- Unified fixed/scrolling Status display and lower-memory sequential video
+  export for large detector stacks.
+- ``Options > ASAXS`` opens the project-local PyAnomScat Stuhrmann GUI. ASAXS
+  ASCII exports include ``_E<energy>`` filenames for direct import.
+
 Basic use
 ---------
 1. Select one or more detector images, then load the matching PONI file.
@@ -35,11 +48,14 @@ Basic use
 4. Use ``Show`` for immediate reference visibility; use ``Update`` after changing
    Subtract or Factor settings.
 5. Export results from ``File > Save``.
+6. For ASAXS analysis, open ``Options > ASAXS`` and import the exported
+   ``*_E<energy>.dat`` curves.
 """
 
 from __future__ import annotations
 
 import os
+import importlib.util
 import re
 import sys
 import threading
@@ -92,6 +108,13 @@ IMAGE_FILTER = (
     "Detector images (*.edf *.edf.gz *.cbf *.tif *.tiff *.img *.mccd *.mar3450 "
     "*.h5 *.hdf5 *.npy);;All files (*)"
 )
+P62_IMAGE_FILTER = "NeXus files (*.nxs);;All files (*)"
+EV_TO_METRE = 1.2398419843320026e-6
+# Keep the integrated analysis tool self-contained: never depend on the
+# original development directory under D:\Program.
+PYANOMSCAT_SCRIPT = Path(__file__).with_name(
+    "pyAnomScat_stuhrmann_method_v3.py"
+)
 MAX_DISPLAY_DIMENSION = 1200
 # pyFAI's sparse CSR lookup can require hundreds of MB for large detectors,
 # especially for a 2-D cake. Keep the established 1-D method unchanged, while
@@ -100,6 +123,11 @@ MAX_DISPLAY_DIMENSION = 1200
 # which allocates detector-sized float64 temporary arrays.
 INTEGRATION_METHOD_1D = "histogram"
 INTEGRATION_METHOD_2D = ("no", "histogram", "cython")
+
+
+def wavelength_from_energy(energy_ev):
+    """Convert photon energy in eV to wavelength in metres."""
+    return EV_TO_METRE / float(energy_ev)
 
 
 def read_ascii_columns(filename):
@@ -176,13 +204,16 @@ class ImageSource:
     path: str
     frame: int | None = None
     frame_count: int = 1
+    dataset_path: str | None = None
+    energy_ev: int | None = None
 
     @property
     def title(self):
         name = Path(self.path).name
+        dataset = "" if self.dataset_path is None else f" [{Path(self.dataset_path).name}]"
         if self.frame is None:
-            return name
-        return f"{name} [Frame {self.frame + 1}/{self.frame_count}]"
+            return f"{name}{dataset}"
+        return f"{name}{dataset} [Frame {self.frame + 1}/{self.frame_count}]"
 
     @property
     def data_filename(self):
@@ -192,8 +223,70 @@ class ImageSource:
         return f"{path.stem}_frame_{self.frame + 1:04d}.dat"
 
 
-def expand_image_file(filename: str) -> list[ImageSource]:
+def read_p62_energy_values(filename):
+    """Return all finite numeric /scan/data/energy values converted to integer eV."""
+    with h5py.File(filename, "r") as nexus:
+        dataset = nexus.get("/scan/data/energy")
+        if not isinstance(dataset, h5py.Dataset):
+            raise KeyError("Missing NeXus dataset /scan/data/energy")
+        values = np.asarray(dataset[()])
+    if values.size < 1 or not np.issubdtype(values.dtype, np.number):
+        raise TypeError("/scan/data/energy must contain numeric energy values")
+    numeric = np.asarray(values, dtype=np.float64).reshape(-1)
+    if not np.all(np.isfinite(numeric)):
+        raise ValueError("/scan/data/energy must contain only finite energy values")
+    result = [int(value) for value in numeric]
+    if any(value <= 0 for value in result):
+        raise ValueError("/scan/data/energy values must be greater than zero")
+    return result
+
+
+def expand_image_file(filename: str, dataset_path=None, include_energy=False) -> list[ImageSource]:
     """Expand a multi-frame HDF5 file into individually selectable frames."""
+    if dataset_path is not None:
+        with h5py.File(filename, "r") as nexus:
+            dataset = nexus.get(dataset_path)
+            if not isinstance(dataset, h5py.Dataset):
+                raise KeyError(f"Missing NeXus image dataset {dataset_path}")
+            if dataset.ndim == 2:
+                count = 1
+                is_stack = False
+            elif dataset.ndim != 3:
+                raise ValueError(
+                    f"{dataset_path} must be a 2-D image or 3-D image stack; "
+                    f"received shape {dataset.shape}"
+                )
+            else:
+                count = int(dataset.shape[0])
+                is_stack = True
+        if count < 1:
+            raise ValueError(f"{dataset_path} contains no image frames")
+        energies = read_p62_energy_values(filename) if include_energy else [None] * count
+        if include_energy and len(energies) != count:
+            if count % len(energies) != 0:
+                raise ValueError(
+                    f"{Path(filename).name}: {dataset_path} contains {count} image(s), "
+                    f"but /scan/data/energy contains {len(energies)} value(s); "
+                    "the image count must be a multiple of the energy count"
+                )
+            repeats_per_energy = count // len(energies)
+            energies = [
+                energy
+                for energy in energies
+                for _ in range(repeats_per_energy)
+            ]
+        if count == 1:
+            return [ImageSource(
+                filename,
+                frame=0 if is_stack else None,
+                frame_count=1,
+                dataset_path=dataset_path,
+                energy_ev=energies[0],
+            )]
+        return [
+            ImageSource(filename, frame, count, dataset_path, energies[frame])
+            for frame in range(count)
+        ]
     if Path(filename).suffix.lower() not in (".h5", ".hdf5", ".nxs"):
         return [ImageSource(filename)]
     image = fabio.open(filename)
@@ -209,11 +302,15 @@ def expand_image_file(filename: str) -> list[ImageSource]:
 def read_image(source: str | ImageSource) -> np.ndarray:
     """Read a detector image using Fabio, with a small convenience for NPY."""
     if isinstance(source, ImageSource):
-        filename, frame = source.path, source.frame
+        filename, frame, dataset_path = source.path, source.frame, source.dataset_path
     else:
-        filename, frame = source, None
+        filename, frame, dataset_path = source, None, None
     try:
-        if filename.lower().endswith(".npy"):
+        if dataset_path is not None:
+            with h5py.File(filename, "r") as nexus:
+                dataset = nexus[dataset_path]
+                data = np.asarray(dataset[()] if frame is None else dataset[frame]).copy()
+        elif filename.lower().endswith(".npy"):
             data = np.load(filename)
         else:
             image = fabio.open(filename)
@@ -244,10 +341,37 @@ def require_integer_detector_image(image, label="Detector image"):
         )
 
 
-def matching_reference_source(reference_sources, sample_source):
-    """Return the single/shared or frame-matched reference for a sample."""
+def matching_reference_source(
+    reference_sources, sample_source, sample_sources=None, sample_index=None
+):
+    """Match references one-to-one for equal lengths, otherwise by energy."""
     if len(reference_sources) == 1:
         return reference_sources[0]
+    if sample_sources is not None and len(reference_sources) == len(sample_sources):
+        if sample_index is None:
+            sample_index = sample_sources.index(sample_source)
+        reference = reference_sources[sample_index]
+        if (
+            sample_source.energy_ev is not None
+            and reference.energy_ev is not None
+            and sample_source.energy_ev != reference.energy_ev
+        ):
+            raise ValueError(
+                f"Energy mismatch at image {sample_index + 1}: sample is "
+                f"{sample_source.energy_ev} eV, reference is {reference.energy_ev} eV"
+            )
+        return reference
+    if isinstance(sample_source, ImageSource) and sample_source.energy_ev is not None:
+        matches = [
+            source for source in reference_sources
+            if source.energy_ev == sample_source.energy_ev
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Expected exactly one reference image at {sample_source.energy_ev} eV; "
+                f"found {len(matches)}"
+            )
+        return matches[0]
     sample_count = (
         sample_source.frame_count
         if isinstance(sample_source, ImageSource) and sample_source.frame is not None
@@ -382,10 +506,11 @@ class IntegrationWorker(qt.QObject):
                 "unit": str(result.unit),
                 "references": {},
                 "reference_cache_keys": {},
+                "reference_cache_values": {},
                 "cake": self.cached_cake,
                 "cake_cache_key": self.cake_cache_key,
             }
-            corrected = payload["sample"].copy()
+            reference_results = []
             for name, data, show, subtract, factor, cache_key, cached in self.references:
                 self._check_cancelled()
                 if cached is None:
@@ -396,13 +521,39 @@ class IntegrationWorker(qt.QObject):
                         azimuth_range=self.azimuth_range,
                         correctSolidAngle=True,
                     )
+                    ref_radial = np.asarray(ref_result.radial)
                     intensity = np.asarray(ref_result.intensity)
                 else:
-                    intensity = cached
-                payload["references"][name] = (intensity, show, subtract, factor)
+                    if isinstance(cached, tuple) and len(cached) == 2:
+                        ref_radial, intensity = cached
+                    else:
+                        ref_radial, intensity = payload["radial"], cached
+                    ref_radial = np.asarray(ref_radial)
+                    intensity = np.asarray(intensity)
+                reference_results.append((
+                    name, ref_radial, intensity, show, subtract, factor, cache_key
+                ))
                 payload["reference_cache_keys"][name] = cache_key
+                payload["reference_cache_values"][name] = (ref_radial, intensity)
+            common = np.ones(payload["radial"].shape, dtype=bool)
+            for _name, ref_radial, _intensity, _show, subtract, _factor, _key in reference_results:
                 if subtract:
-                    corrected -= factor * intensity
+                    common &= (
+                        (payload["radial"] >= np.min(ref_radial))
+                        & (payload["radial"] <= np.max(ref_radial))
+                    )
+            if not np.any(common):
+                raise ValueError("Sample and reference curves have no common q range")
+            payload["radial"] = payload["radial"][common]
+            payload["sample"] = payload["sample"][common]
+            corrected = payload["sample"].copy()
+            for name, ref_radial, intensity, show, subtract, factor, _key in reference_results:
+                if ref_radial[0] > ref_radial[-1]:
+                    ref_radial, intensity = ref_radial[::-1], intensity[::-1]
+                aligned = np.interp(payload["radial"], ref_radial, intensity)
+                payload["references"][name] = (aligned, show, subtract, factor)
+                if subtract:
+                    corrected -= factor * aligned
             payload["corrected"] = corrected
             # Cake is deliberately last: all 1-D and subtraction work finishes
             # before the higher-memory 2-D integration starts.
@@ -561,7 +712,8 @@ class BatchIntegrationWorker(qt.QObject):
     def __init__(
         self, paths, output_dir, poni, user_mask, points, unit, radial_range,
         azimuth_range,
-        references=None,
+        references=None, use_source_energy=False,
+        include_energy_in_filename=False,
     ):
         super().__init__()
         self.paths = paths
@@ -573,6 +725,8 @@ class BatchIntegrationWorker(qt.QObject):
         self.radial_range = radial_range
         self.azimuth_range = azimuth_range
         self.references = references or []
+        self.use_source_energy = use_source_energy
+        self.include_energy_in_filename = include_energy_in_filename
         self._cancel_requested = threading.Event()
 
     def cancel(self):
@@ -590,7 +744,11 @@ class BatchIntegrationWorker(qt.QObject):
                 if self._cancel_requested.is_set():
                     self.cancelled.emit()
                     return
-                if isinstance(path, ImageSource) and path.frame is not None:
+                if (
+                    isinstance(path, ImageSource)
+                    and path.frame is not None
+                    and path.dataset_path is None
+                ):
                     reader = readers.get(path.path)
                     if reader is None:
                         reader = fabio.open(path.path)
@@ -599,6 +757,13 @@ class BatchIntegrationWorker(qt.QObject):
                 else:
                     image = read_image(path)
                 source_name = path.title if isinstance(path, ImageSource) else Path(path).name
+                energy_ev = (
+                    path.energy_ev
+                    if self.use_source_energy and isinstance(path, ImageSource)
+                    else None
+                )
+                if energy_ev is not None:
+                    integrator.wavelength = wavelength_from_energy(energy_ev)
                 require_integer_detector_image(image, source_name)
                 detector = integrator.detector
                 if not detector_accepts_shape(detector, image.shape):
@@ -632,13 +797,21 @@ class BatchIntegrationWorker(qt.QObject):
                 columns = [result.radial, result.intensity]
                 column_names = [str(result.unit), "Intensity"]
                 comments = []
+                if isinstance(path, ImageSource) and path.energy_ev is not None:
+                    comments.append(f"Energy: {path.energy_ev} eV")
+                    comments.append(
+                        f"Wavelength used: {integrator.wavelength:.12g} m"
+                    )
                 corrected = np.asarray(result.intensity).copy()
                 reference_columns = []
+                common_q = np.ones(np.asarray(result.radial).shape, dtype=bool)
                 for name, ref_sources, _ref_file, factor, subtract in self.references:
                     if self._cancel_requested.is_set():
                         self.cancelled.emit()
                         return
-                    ref_source = matching_reference_source(ref_sources, path)
+                    ref_source = matching_reference_source(
+                        ref_sources, path, self.paths, index - 1
+                    )
                     # Key before reading: a cache hit avoids both reopening the
                     # reference frame and repeating its pyFAI integration.
                     cache_key = (
@@ -646,10 +819,11 @@ class BatchIntegrationWorker(qt.QObject):
                         os.path.abspath(ref_source.path),
                         ref_source.frame,
                         mask_key,
+                        integrator.wavelength,
                     )
-                    reference_intensity = reference_cache.get(cache_key)
-                    if reference_intensity is None:
-                        if ref_source.frame is not None:
+                    reference_curve = reference_cache.get(cache_key)
+                    if reference_curve is None:
+                        if ref_source.frame is not None and ref_source.dataset_path is None:
                             ref_reader = readers.get(ref_source.path)
                             if ref_reader is None:
                                 ref_reader = fabio.open(ref_source.path)
@@ -673,9 +847,22 @@ class BatchIntegrationWorker(qt.QObject):
                             azimuth_range=self.azimuth_range,
                             correctSolidAngle=True,
                         )
-                        reference_intensity = np.asarray(ref_result.intensity)
-                        reference_cache[cache_key] = reference_intensity
-                    scaled = factor * reference_intensity
+                        reference_curve = (
+                            np.asarray(ref_result.radial),
+                            np.asarray(ref_result.intensity),
+                        )
+                        reference_cache[cache_key] = reference_curve
+                    ref_radial, reference_intensity = reference_curve
+                    if ref_radial[0] > ref_radial[-1]:
+                        ref_radial = ref_radial[::-1]
+                        reference_intensity = reference_intensity[::-1]
+                    if subtract:
+                        common_q &= (
+                            (result.radial >= np.min(ref_radial))
+                            & (result.radial <= np.max(ref_radial))
+                        )
+                    aligned = np.interp(result.radial, ref_radial, reference_intensity)
+                    scaled = factor * aligned
                     if subtract:
                         corrected -= scaled
                     reference_columns.append((name, scaled))
@@ -683,6 +870,16 @@ class BatchIntegrationWorker(qt.QObject):
                         f"{name} file: {ref_source.title}; factor: {factor:.2f}"
                     )
                 if reference_columns:
+                    if not np.any(common_q):
+                        raise ValueError(
+                            f"{source_name}: sample and reference curves have no common q range"
+                        )
+                    columns = [np.asarray(column)[common_q] for column in columns]
+                    corrected = corrected[common_q]
+                    reference_columns = [
+                        (name, values[common_q])
+                        for name, values in reference_columns
+                    ]
                     columns.append(corrected)
                     column_names.append("Subtracted")
                     for name, scaled in reference_columns:
@@ -692,6 +889,18 @@ class BatchIntegrationWorker(qt.QObject):
                     path.data_filename if isinstance(path, ImageSource)
                     else Path(path).with_suffix(".dat").name
                 )
+                if (
+                    self.include_energy_in_filename
+                    and isinstance(path, ImageSource)
+                    and path.energy_ev is not None
+                ):
+                    # PyAnomScat's importer recognizes the trailing _E<float>
+                    # token and uses it as the photon energy in eV.
+                    output_path_name = Path(output_name)
+                    output_name = (
+                        f"{output_path_name.stem}_E{path.energy_ev}"
+                        f"{output_path_name.suffix}"
+                    )
                 output_path = Path(self.output_dir) / output_name
                 np.savetxt(
                     output_path,
@@ -715,9 +924,11 @@ class ImageLoadWorker(qt.QObject):
     failed = qt.Signal(str)
     cancelled = qt.Signal()
 
-    def __init__(self, filenames):
+    def __init__(self, filenames, dataset_path=None, include_energy=False):
         super().__init__()
         self.filenames = list(filenames)
+        self.dataset_path = dataset_path
+        self.include_energy = include_energy
         self._cancel_requested = threading.Event()
 
     def cancel(self):
@@ -732,7 +943,9 @@ class ImageLoadWorker(qt.QObject):
                 if self._cancel_requested.is_set():
                     self.cancelled.emit()
                     return
-                sources.extend(expand_image_file(filename))
+                sources.extend(expand_image_file(
+                    filename, self.dataset_path, self.include_energy
+                ))
                 self.progress.emit(index, total, Path(filename).name)
             if self._cancel_requested.is_set():
                 self.cancelled.emit()
@@ -1019,11 +1232,146 @@ class ExternalCurveWindow(qt.QMainWindow):
         self.plot.resetZoom()
 
 
+class MultiAsciiCurveWindow(qt.QMainWindow):
+    """Plot ASCII curves with visibility controls and independent log axes."""
+
+    def __init__(self, curves, x_label, y_label, parent=None):
+        super().__init__(parent)
+        self.setAttribute(qt.Qt.WA_DeleteOnClose)
+        self.setWindowTitle("Multiple ASCII Data")
+        self.resize(1050, 700)
+        self.plot = Plot1D(self)
+        self.setCentralWidget(self.plot)
+        self.plot.setGraphTitle("Multiple ASCII Data")
+        self.plot.setGraphXLabel(x_label)
+        self.plot.setGraphYLabel(y_label)
+        self.plot.setDataMargins(0.05, 0.05, 0.05, 0.05)
+        self._curve_data = {}
+        self._curve_items = {}
+
+        # Expose silx's native logarithmic-axis actions in Plot1D's main
+        # toolbar, exactly where the main integration window shows its plot
+        # controls. The interactive-mode toolbar can be hidden by silx.
+        plot_toolbar = self.plot.toolBar()
+        plot_toolbar.addSeparator()
+        self.log_x_action = self.plot.getXAxisLogarithmicAction()
+        self.log_y_action = self.plot.getYAxisLogarithmicAction()
+        self.log_x_action.setText("Log X")
+        self.log_y_action.setText("Log Y")
+        self.log_x_action.setToolTip("Toggle logarithmic X axis")
+        self.log_y_action.setToolTip("Toggle logarithmic Y axis")
+        self.log_x_action.setVisible(True)
+        self.log_y_action.setVisible(True)
+        plot_toolbar.addAction(self.log_x_action)
+        plot_toolbar.addAction(self.log_y_action)
+        self.log_x_action.toggled.connect(self._axis_scale_changed)
+        self.log_y_action.toggled.connect(self._axis_scale_changed)
+
+        visibility_dock = qt.QDockWidget("Curves", self)
+        visibility_dock.setObjectName("multipleAsciiCurvesDock")
+        visibility_dock.setFeatures(
+            qt.QDockWidget.DockWidgetMovable | qt.QDockWidget.DockWidgetFloatable
+        )
+        curve_list = qt.QListWidget(visibility_dock)
+        curve_list.setAlternatingRowColors(True)
+        curve_list.setIconSize(qt.QSize(48, 16))
+        visibility_dock.setWidget(curve_list)
+        self.addDockWidget(qt.Qt.RightDockWidgetArea, visibility_dock)
+        self.curve_list = curve_list
+
+        for legend, x_values, y_values in curves:
+            self._curve_data[legend] = (
+                np.asarray(x_values), np.asarray(y_values)
+            )
+            curve = self.plot.addCurve(
+                x_values, y_values, legend=legend, resetzoom=False
+            )
+            item = qt.QListWidgetItem(legend)
+            item.setIcon(self._curve_style_icon(curve))
+            item.setToolTip(
+                f"{legend}\nColor: {curve.getColor()}\n"
+                f"Line style: {curve.getLineStyle()}"
+            )
+            item.setFlags(item.flags() | qt.Qt.ItemIsUserCheckable)
+            item.setCheckState(qt.Qt.Checked)
+            curve_list.addItem(item)
+            self._curve_items[legend] = item
+        curve_list.itemChanged.connect(self._curve_visibility_changed)
+        self.plot.resetZoom()
+
+    @staticmethod
+    def _curve_style_icon(curve):
+        """Render a curve's color and line style for the right-side list."""
+        color = curve.getColor()
+        if isinstance(color, str):
+            qcolor = qt.QColor(color)
+        else:
+            values = np.asarray(color, dtype=float).ravel()
+            if values.size >= 3 and np.nanmax(values[:3]) <= 1.0:
+                alpha = values[3] if values.size > 3 else 1.0
+                qcolor = qt.QColor.fromRgbF(
+                    values[0], values[1], values[2], alpha
+                )
+            else:
+                alpha = int(values[3]) if values.size > 3 else 255
+                qcolor = qt.QColor(
+                    int(values[0]), int(values[1]), int(values[2]), alpha
+                )
+
+        pixmap = qt.QPixmap(48, 16)
+        pixmap.fill(qt.Qt.transparent)
+        painter = qt.QPainter(pixmap)
+        pen = qt.QPen(qcolor)
+        pen.setWidth(max(2, int(round(curve.getLineWidth()))))
+        pen.setStyle({
+            "--": qt.Qt.DashLine,
+            "-.": qt.Qt.DashDotLine,
+            ":": qt.Qt.DotLine,
+        }.get(curve.getLineStyle(), qt.Qt.SolidLine))
+        painter.setPen(pen)
+        painter.drawLine(3, 8, 45, 8)
+        painter.end()
+        return qt.QIcon(pixmap)
+
+    @qt.Slot(bool)
+    def _axis_scale_changed(self, _checked=False):
+        """Apply the visible toolbar actions to the actual plot axes."""
+        self.plot.getXAxis().setScale(
+            "log" if self.log_x_action.isChecked() else "linear"
+        )
+        self.plot.getYAxis().setScale(
+            "log" if self.log_y_action.isChecked() else "linear"
+        )
+        self.plot.resetZoom()
+
+    @qt.Slot(qt.QListWidgetItem)
+    def _curve_visibility_changed(self, item):
+        curve = self.plot.getCurve(item.text())
+        if curve is not None:
+            curve.setVisible(item.checkState() == qt.Qt.Checked)
+            self.plot.replot()
+
+
+class StatusPanelProxy:
+    """Route legacy status-label writes into the unified Status panel."""
+
+    def __init__(self, update_callback):
+        self._update_callback = update_callback
+        self._text = ""
+
+    def setText(self, text):
+        self._text = str(text)
+        self._update_callback("operation", "Status", self._text)
+
+    def text(self):
+        return self._text
+
+
 class MainWindow(qt.QMainWindow):
     def __init__(self):
         super().__init__()
         qt.QLocale.setDefault(qt.QLocale("en_US"))
-        self.setWindowTitle("pyFAI Integrate Viewer v2")
+        self.setWindowTitle("pyFAI Integrate Viewer v3")
         self.resize(1900, 850)
         self._settings = qt.QSettings(
             "pyFAI Integrate Viewer", "pyFAI Integrate Viewer"
@@ -1043,6 +1391,8 @@ class MainWindow(qt.QMainWindow):
         self.image_data: np.ndarray | None = None
         self.image_paths: list[ImageSource] = []
         self.image_index = -1
+        self._beamline = None
+        self._measurement_mode = None
         self.mask_data: np.ndarray | None = None
         self.empty_data: np.ndarray | None = None
         self.background_data: np.ndarray | None = None
@@ -1052,6 +1402,7 @@ class MainWindow(qt.QMainWindow):
         self._effective_mask_crc = None
         self._effective_mask_cache_valid = False
         self.integrator = None
+        self._poni_wavelength = None
         self._thread = None
         self._worker = None
         self._load_thread = None
@@ -1087,6 +1438,7 @@ class MainWindow(qt.QMainWindow):
         self._batch_video_original_auto = False
         self._video_progress_key = ""
         self._progress_blocks = {}
+        self._fixed_status_blocks = {}
         self._batch_thread = None
         self._batch_worker = None
         self._batch_worker_result = None
@@ -1108,6 +1460,8 @@ class MainWindow(qt.QMainWindow):
         self._syncing_integration_x = False
         self._result_y_autoscale_pending = False
         self._external_plot_windows = []
+        self._asaxs_windows = []
+        self._asaxs_module = None
         self._build_ui()
         self._build_menu_bar()
 
@@ -1119,6 +1473,10 @@ class MainWindow(qt.QMainWindow):
         self.export_path_action = path_menu.addAction("Export Path...")
         self.input_path_action.triggered.connect(self.choose_input_path)
         self.export_path_action.triggered.connect(self.choose_export_path)
+        beamline_menu = file_menu.addMenu("Beamline")
+        self.p62_action = beamline_menu.addAction("p62")
+        self.p62_action.setCheckable(True)
+        self.p62_action.toggled.connect(self._set_p62_enabled)
         file_menu.addSeparator()
         save_menu = file_menu.addMenu("Save")
         self.save_current_action = save_menu.addAction("Plot (current view)")
@@ -1132,8 +1490,10 @@ class MainWindow(qt.QMainWindow):
         options_menu = menu_bar.addMenu("Options")
         self.plot_nexus_action = options_menu.addAction("Plot NeXus...")
         self.plot_ascii_action = options_menu.addAction("Plot ASCII...")
+        self.asaxs_action = options_menu.addAction("ASAXS...")
         self.plot_nexus_action.triggered.connect(self.plot_nexus_data)
         self.plot_ascii_action.triggered.connect(self.plot_ascii_data)
+        self.asaxs_action.triggered.connect(self.open_asaxs_window)
         # Keep the view selector in the menu-bar row so it does not push the
         # integration toolbar below the Source image toolbar.
         menu_bar.setCornerWidget(self.right_tab_bar, qt.Qt.TopRightCorner)
@@ -1157,6 +1517,53 @@ class MainWindow(qt.QMainWindow):
             self._external_plot_windows.remove(window)
 
     @qt.Slot()
+    def open_asaxs_window(self):
+        """Open the PyAnomScat Stuhrmann GUI as a child application window."""
+        try:
+            if not PYANOMSCAT_SCRIPT.is_file():
+                raise FileNotFoundError(f"ASAXS GUI not found: {PYANOMSCAT_SCRIPT}")
+            if self._asaxs_module is None:
+                module_name = "integrated_pyanomscat_stuhrmann_v3"
+                spec = importlib.util.spec_from_file_location(
+                    module_name, PYANOMSCAT_SCRIPT
+                )
+                if spec is None or spec.loader is None:
+                    raise ImportError(f"Cannot load {PYANOMSCAT_SCRIPT}")
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+                self._asaxs_module = module
+            previous_directory = os.getcwd()
+            try:
+                os.chdir(PYANOMSCAT_SCRIPT.parent)
+                window = self._asaxs_module.MainWindow(parent=self)
+            finally:
+                os.chdir(previous_directory)
+            window.appImportPath = self.input_path
+            if hasattr(window, "statusbar"):
+                window.statusbar.showMessage(window.appImportPath)
+            window.setAttribute(qt.Qt.WA_DeleteOnClose)
+            self._asaxs_windows.append(window)
+            window.destroyed.connect(
+                lambda _=None, window=window: self._remove_asaxs_window(window)
+            )
+            window.show()
+        except Exception as error:
+            self.show_error("Cannot Open ASAXS", traceback.format_exc())
+
+    def _remove_asaxs_window(self, window):
+        if window in self._asaxs_windows:
+            self._asaxs_windows.remove(window)
+
+    def _show_external_curves(self, curves, x_label, y_label):
+        window = MultiAsciiCurveWindow(curves, x_label, y_label, self)
+        self._external_plot_windows.append(window)
+        window.destroyed.connect(
+            lambda _=None, window=window: self._remove_external_plot(window)
+        )
+        window.show()
+
+    @qt.Slot()
     def plot_nexus_data(self):
         filename, _ = qt.QFileDialog.getOpenFileName(
             self, "Select NeXus File", self.input_path,
@@ -1178,32 +1585,52 @@ class MainWindow(qt.QMainWindow):
 
     @qt.Slot()
     def plot_ascii_data(self):
-        filename, _ = qt.QFileDialog.getOpenFileName(
-            self, "Select ASCII File", self.input_path,
+        self.plot_multiple_ascii_data()
+
+    @qt.Slot()
+    def plot_multiple_ascii_data(self):
+        filenames, _ = qt.QFileDialog.getOpenFileNames(
+            self, "Select One or More ASCII Files", self.input_path,
             "ASCII data (*.dat *.txt *.csv *.asc);;All files (*)",
         )
-        if not filename:
+        if not filenames:
             return
-        self._set_input_path(str(Path(filename).parent))
+        self._set_input_path(str(Path(filenames[0]).parent))
         try:
-            data, names = read_ascii_columns(filename)
+            tables = []
+            for filename in filenames:
+                data, names = read_ascii_columns(filename)
+                tables.append((filename, data, names))
+            first_data, first_names = tables[0][1], tables[0][2]
             choices = [
-                f"Column {index + 1}: {names[index]}" if names
+                f"Column {index + 1}: {first_names[index]}" if first_names
                 else f"Column {index + 1}"
-                for index in range(data.shape[1])
+                for index in range(first_data.shape[1])
             ]
             dialog = XYSelectionDialog(
-                "Select ASCII X and Y Columns", choices, self
+                "Select X and Y Columns for All ASCII Files", choices, self
             )
             if dialog.exec() != qt.QDialog.Accepted:
                 return
             x_index, y_index, x_label, y_label = dialog.selection()
-            self._show_external_curve(
-                data[:, x_index], data[:, y_index],
-                x_label, y_label, filename,
-            )
+            curves = []
+            used_legends = {}
+            for filename, data, _names in tables:
+                if max(x_index, y_index) >= data.shape[1]:
+                    raise ValueError(
+                        f"{Path(filename).name} has only {data.shape[1]} columns; "
+                        f"the selected columns are unavailable."
+                    )
+                base_legend = Path(filename).name
+                used_legends[base_legend] = used_legends.get(base_legend, 0) + 1
+                count = used_legends[base_legend]
+                legend = base_legend if count == 1 else f"{base_legend} ({count})"
+                curves.append((legend, data[:, x_index], data[:, y_index]))
+            self._show_external_curves(curves, x_label, y_label)
         except Exception as error:
-            qt.QMessageBox.critical(self, "Cannot Plot ASCII Data", str(error))
+            qt.QMessageBox.critical(
+                self, "Cannot Plot Multiple ASCII Data", str(error)
+            )
 
     def _set_save_actions_enabled(self, enabled):
         for action in (
@@ -1254,6 +1681,22 @@ class MainWindow(qt.QMainWindow):
         controls = qt.QWidget()
         form_box = qt.QVBoxLayout(controls)
         controls.setMaximumWidth(380)
+
+        self.p62_mode_widget = qt.QWidget()
+        p62_mode_layout = qt.QHBoxLayout(self.p62_mode_widget)
+        p62_mode_layout.setContentsMargins(0, 0, 0, 0)
+        self.p62_mode_group = qt.QButtonGroup(self)
+        self.p62_mode_group.setExclusive(True)
+        for mode in ("saxs", "waxs", "asaxs", "awaxs"):
+            button = qt.QPushButton(mode)
+            button.setCheckable(True)
+            button.clicked.connect(
+                lambda checked=False, selected=mode: self._select_p62_mode(selected)
+            )
+            self.p62_mode_group.addButton(button)
+            p62_mode_layout.addWidget(button)
+        self.p62_mode_widget.setVisible(False)
+        form_box.addWidget(self.p62_mode_widget)
 
         files = qt.QGroupBox("Input Files")
         grid = qt.QGridLayout(files)
@@ -1369,20 +1812,29 @@ class MainWindow(qt.QMainWindow):
         operation_layout.addWidget(self.integrate_button, 1)
         operation_layout.addWidget(self.stop_button)
         form_box.addWidget(operation_buttons)
-        self.status_label = qt.QLabel("Select a 2-D diffraction image and a PONI file")
-        self.status_label.setWordWrap(True)
-        form_box.addWidget(self.status_label)
         progress_box = qt.QGroupBox("Status")
         progress_layout = qt.QVBoxLayout(progress_box)
+        self.status_summary = qt.QPlainTextEdit()
+        self.status_summary.setReadOnly(True)
+        self.status_summary.setMinimumHeight(150)
+        self.status_summary.setMaximumHeight(190)
+        self.status_summary.setVerticalScrollBarPolicy(qt.Qt.ScrollBarAlwaysOff)
+        self.status_summary.setHorizontalScrollBarPolicy(qt.Qt.ScrollBarAlwaysOff)
         self.export_progress = qt.QPlainTextEdit()
         self.export_progress.setReadOnly(True)
         self.export_progress.setPlaceholderText(
             "Loading, integration, and export status appears here"
         )
-        self.export_progress.setMinimumHeight(130)
+        self.export_progress.setMinimumHeight(65)
+        self.export_progress.setMaximumHeight(90)
         self.export_progress.setMaximumBlockCount(1000)
-        progress_layout.addWidget(self.export_progress)
+        progress_layout.addWidget(self.status_summary)
+        progress_layout.addWidget(self.export_progress, 1)
         form_box.addWidget(progress_box)
+        self.status_label = StatusPanelProxy(self._update_export_progress_block)
+        self.status_label.setText(
+            "Select a 2-D diffraction image and a PONI file"
+        )
         form_box.addStretch(1)
 
         splitter = qt.QSplitter(qt.Qt.Horizontal)
@@ -2077,6 +2529,66 @@ class MainWindow(qt.QMainWindow):
             return ""
         return f"Image {self.image_index + 1} of {len(self.image_paths)}"
 
+    def _subtraction_reference_text(self, sample_index=None, sample_sources=None):
+        """Describe the exact Empty/Background sources used for subtraction."""
+        sources = self.image_paths if sample_sources is None else sample_sources
+        index = self.image_index if sample_index is None else sample_index
+        if not (0 <= index < len(sources)):
+            return ""
+        parts = []
+        sample_source = sources[index]
+        for kind in ("empty", "background"):
+            subtract = getattr(self, f"subtract_{kind}_check").isChecked()
+            references = self._reference_sources[kind]
+            if not subtract or not references:
+                continue
+            try:
+                reference = matching_reference_source(
+                    references, sample_source, sources, index
+                )
+            except ValueError as error:
+                parts.append(f"{kind.title()}: {error}")
+            else:
+                parts.append(f"{kind.title()} subtraction: {reference.title}")
+        return "; ".join(parts)
+
+    @staticmethod
+    def _source_file_frame_progress(sources, index):
+        """Return global file progress plus frame progress for one source."""
+        if not (0 <= index < len(sources)):
+            return ""
+        source = sources[index]
+        source_path = source.path if isinstance(source, ImageSource) else str(source)
+        grouped = group_batch_video_sources(sources)
+        source_group = next(
+            (ordered for _prefix, ordered in grouped if source in ordered),
+            list(sources),
+        )
+        ordered_files = list(dict.fromkeys(
+            item.path if isinstance(item, ImageSource) else str(item)
+            for item in source_group
+        ))
+        file_index = ordered_files.index(source_path) + 1
+        text = f"file [{file_index}/{len(ordered_files)}]"
+        if isinstance(source, ImageSource) and source.frame is not None:
+            text += f"; frame [{source.frame + 1}/{source.frame_count}]"
+        else:
+            text += "; frame [1/1]"
+        return text
+
+    def _video_saving_position(self, source):
+        """Return position across every selected image/frame, not one video group."""
+        all_sources = (
+            self._batch_video_original_paths
+            if self._batch_video_original_paths is not None
+            else self.image_paths
+        )
+        try:
+            current = all_sources.index(source) + 1
+        except ValueError:
+            current = self.image_index + 1
+        return current, len(all_sources)
+
     def _current_source_key(self):
         if not (0 <= self.image_index < len(self.image_paths)):
             return None
@@ -2097,6 +2609,7 @@ class MainWindow(qt.QMainWindow):
         )
         return (
             self._current_source_key(), os.path.abspath(poni), poni_mtime,
+            None if self.integrator is None else self.integrator.wavelength,
             self.points_spin.value(), self.unit_combo.currentText(),
             radial_range, azimuth_range, mask_summary,
         )
@@ -2104,7 +2617,8 @@ class MainWindow(qt.QMainWindow):
     def _reference_cache_key(self, name, radial_range, azimuth_range):
         kind = name.casefold()
         ref_source = matching_reference_source(
-            self._reference_sources[kind], self.image_paths[self.image_index]
+            self._reference_sources[kind], self.image_paths[self.image_index],
+            self.image_paths, self.image_index,
         )
         try:
             reference_mtime = os.path.getmtime(ref_source.path)
@@ -2122,6 +2636,7 @@ class MainWindow(qt.QMainWindow):
     def _reset_export_progress(self):
         self._progress_blocks.clear()
         self.export_progress.clear()
+        self._update_subtraction_status_block()
 
     def _append_export_progress(self, text):
         self.export_progress.appendPlainText(text)
@@ -2134,7 +2649,48 @@ class MainWindow(qt.QMainWindow):
 
     def _update_export_progress_block(self, key, label, progress):
         """Add a filename once, then update only its following progress line."""
-        self._progress_blocks[key] = f"{label}:\n    {progress}"
+        if key == "operation" and self._exporting_video:
+            return
+        if key in ("operation", "subtraction"):
+            if key == "operation":
+                label = "Status"
+            self._fixed_status_blocks[key] = f"{label}:\n    {progress}"
+            self.status_summary.setPlainText(
+                "\n".join(self._fixed_status_blocks.values())
+            )
+            return
+        self._progress_blocks[key] = (
+            f"{label}:\n    {progress}" if progress else str(label)
+        )
+        self.export_progress.setPlainText("\n".join(self._progress_blocks.values()))
+        scroll_bar = self.export_progress.verticalScrollBar()
+        scroll_bar.setValue(scroll_bar.maximum())
+
+    def _update_subtraction_status_block(self, sample_index=None):
+        """Show matched subtraction files inside the existing Status panel."""
+        text = self._subtraction_reference_text(sample_index)
+        if text:
+            self._fixed_status_blocks["subtraction"] = (
+                f"Subtraction:\n    {text}"
+            )
+        else:
+            self._fixed_status_blocks.pop("subtraction", None)
+        self.status_summary.setPlainText(
+            "\n".join(self._fixed_status_blocks.values())
+        )
+
+    def _update_video_status(self, progress):
+        """Update fixed video progress without allowing transient frame states."""
+        self._fixed_status_blocks["operation"] = f"Status:\n    {progress}"
+        self.status_summary.setPlainText(
+            "\n".join(self._fixed_status_blocks.values())
+        )
+
+    def _update_scrolling_filename(self, source, prefix="file"):
+        """Add only a source filename to the scrolling Status history."""
+        path = source.path if isinstance(source, ImageSource) else str(source)
+        key = f"{prefix}:{os.path.abspath(path)}"
+        self._progress_blocks[key] = Path(path).name
         self.export_progress.setPlainText("\n".join(self._progress_blocks.values()))
         scroll_bar = self.export_progress.verticalScrollBar()
         scroll_bar.setValue(scroll_bar.maximum())
@@ -2143,6 +2699,7 @@ class MainWindow(qt.QMainWindow):
         """Clear geometry and masks when an image does not fit the detector."""
         self._mask_generation += 1  # Ignore results from an older mask job
         self.integrator = None
+        self._poni_wavelength = None
         self.detector_mask = None
         self._effective_mask_cache_valid = False
         self._detector_mask_cache.clear()
@@ -2463,6 +3020,21 @@ class MainWindow(qt.QMainWindow):
                 self._detector_mask_cache[shape_key], generation, ""
             )
             return
+        if self._exporting_video:
+            try:
+                mask = detector_mask_for_image(
+                    self.integrator.detector, self.image_data
+                )
+                if mask is not None:
+                    mask = np.asarray(mask, dtype=bool)
+                    if mask.shape != self.image_data.shape:
+                        mask = None
+                error = ""
+            except Exception:
+                mask = None
+                error = traceback.format_exc()
+            self._detector_mask_finished(mask, generation, error)
+            return
         thread = qt.QThread(self)
         worker = DetectorMaskWorker(self.integrator.detector, self.image_data, generation)
         worker.moveToThread(thread)
@@ -2471,11 +3043,15 @@ class MainWindow(qt.QMainWindow):
         worker.cancelled.connect(thread.quit)
         worker.finished.connect(thread.quit)
         worker.cancelled.connect(worker.deleteLater)
-        thread.finished.connect(worker.deleteLater)
+        worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         job = (thread, worker)
         self._mask_jobs.append(job)
-        thread.finished.connect(lambda job=job: self._remove_mask_job(job))
+        thread.finished.connect(
+            lambda job=job: qt.QTimer.singleShot(
+                50, lambda job=job: self._remove_mask_job(job)
+            )
+        )
         self.integrate_button.setEnabled(False)
         self.status_label.setText("PONI loaded; calculating detector mask in background...")
         thread.start()
@@ -2527,30 +3103,101 @@ class MainWindow(qt.QMainWindow):
         shape = getattr(detector, "shape", None) or getattr(detector, "max_shape", None)
         pixel1 = getattr(detector, "pixel1", None)
         pixel2 = getattr(detector, "pixel2", None)
-        lines = [f"Detector: {name}", f"Shape: {shape or 'unknown'}"]
+        lines = [f"Detector: {name}    Shape: {shape or 'unknown'}"]
         if pixel1 is not None and pixel2 is not None:
-            lines.append(f"Pixel size: {pixel2 * 1e6:.3f} x {pixel1 * 1e6:.3f} um")
-        lines.append(f"Distance: {self.integrator.dist * 1e3:.3f} mm")
+            geometry_line = (
+                f"Pixel: {pixel2 * 1e6:.3f} x {pixel1 * 1e6:.3f} um    "
+                f"Distance: {self.integrator.dist * 1e3:.3f} mm"
+            )
+        else:
+            geometry_line = f"Distance: {self.integrator.dist * 1e3:.3f} mm"
+        lines.append(geometry_line)
+        energy_ev = self._current_energy_ev()
+        if energy_ev is not None:
+            lines.append(
+                f"Energy: {energy_ev} eV    "
+                f"Wavelength: {wavelength_from_energy(energy_ev):.12g} m"
+            )
         if self.integrator.wavelength is not None:
-            lines.append(f"Wavelength: {self.integrator.wavelength * 1e10:.6g} A")
+            if energy_ev is None:
+                lines.append(f"Wavelength: {self.integrator.wavelength * 1e10:.6g} A")
         self.detector_label.setText("\n".join(lines))
+
+    @qt.Slot(bool)
+    def _set_p62_enabled(self, enabled):
+        self._beamline = "p62" if enabled else None
+        self.p62_mode_widget.setVisible(enabled)
+        if not enabled:
+            self._measurement_mode = None
+            self._apply_current_energy()
+
+    def _select_p62_mode(self, mode):
+        self._measurement_mode = mode
+        self.status_label.setText(f"p62 mode: {mode.upper()}")
+        self._apply_current_energy()
+
+    def _current_energy_ev(self):
+        if (
+            self._beamline != "p62"
+            or self._measurement_mode not in ("asaxs", "awaxs")
+        ):
+            return None
+        if not (0 <= self.image_index < len(self.image_paths)):
+            return None
+        return self.image_paths[self.image_index].energy_ev
+
+    def _apply_current_energy(self):
+        if self.integrator is None:
+            return
+        energy_ev = self._current_energy_ev()
+        if energy_ev is not None:
+            self.integrator.wavelength = wavelength_from_energy(energy_ev)
+            self._cake_cache.clear()
+            self._reference_curve_cache.clear()
+        else:
+            self.integrator.wavelength = self._poni_wavelength
+        self._show_detector_information()
 
     @qt.Slot()
     def choose_image(self):
         if self._has_active_operation():
             return
+        p62_mode = self._measurement_mode if self._beamline == "p62" else None
+        if self._beamline == "p62" and p62_mode is None:
+            self.show_error(
+                "p62 Mode Required",
+                "Select saxs, waxs, asaxs, or awaxs before loading images.",
+            )
+            return
+        dataset_path = {
+            "saxs": "/scan/data/saxs_raw",
+            "asaxs": "/scan/data/saxs_raw",
+            "waxs": "/scan/data/waxs_raw",
+            "awaxs": "/scan/data/waxs_raw",
+        }.get(p62_mode)
         filenames, _ = qt.QFileDialog.getOpenFileNames(
-            self, "Select 2-D Diffraction Images", self.input_path, IMAGE_FILTER
+            self, "Select 2-D Diffraction Images", self.input_path,
+            P62_IMAGE_FILTER if p62_mode else IMAGE_FILTER,
         )
         if not filenames:
             return
+        if p62_mode:
+            try:
+                invalid = [name for name in filenames if Path(name).suffix.lower() != ".nxs"]
+                if invalid:
+                    raise ValueError(f"p62 {p62_mode.upper()} image loading accepts only .nxs files")
+            except Exception as exc:
+                self.show_error(f"Invalid p62 {p62_mode.upper()} NeXus File", str(exc))
+                return
         self._set_input_path(Path(filenames[0]).parent)
         for reader in self._image_readers.values():
             reader.close()
         self._image_readers.clear()
         self._operation_cancel_requested = False
         self._load_thread = qt.QThread(self)
-        self._load_worker = ImageLoadWorker(filenames)
+        self._load_worker = ImageLoadWorker(
+            filenames, dataset_path, include_energy=bool(p62_mode)
+        )
         self._load_worker.moveToThread(self._load_thread)
         self._load_thread.started.connect(self._load_worker.run)
         self._load_worker.progress.connect(self._image_load_progress)
@@ -2623,6 +3270,7 @@ class MainWindow(qt.QMainWindow):
             self._update_navigation_buttons()
             return
         self.image_data = data
+        self._apply_current_energy()
         self.image_edit.setText(source.title)
         references_cleared = False
         for kind in ("empty", "background"):
@@ -2632,7 +3280,8 @@ class MainWindow(qt.QMainWindow):
             if len(reference_sources) > 1:
                 try:
                     reference_source = matching_reference_source(
-                        reference_sources, source
+                        reference_sources, source, self.image_paths,
+                        self.image_index,
                     )
                     setattr(self, f"{kind}_data", read_image(reference_source))
                 except Exception as exc:
@@ -2682,6 +3331,7 @@ class MainWindow(qt.QMainWindow):
             self._reference_curve_cache.clear()
             status += "; incompatible Empty/Background cleared"
         self.status_label.setText(status)
+        self._update_subtraction_status_block()
         self._update_navigation_buttons()
         self._pending_auto_integration = (
             self._auto_integrate_images and self.integrator is not None
@@ -2706,6 +3356,7 @@ class MainWindow(qt.QMainWindow):
         if filename:
             try:
                 self.integrator = pyFAI.load(filename)
+                self._poni_wavelength = self.integrator.wavelength
             except Exception as exc:
                 self.show_error("Invalid PONI File", str(exc))
                 return
@@ -2721,6 +3372,7 @@ class MainWindow(qt.QMainWindow):
                 )
                 return
             self.poni_edit.setText(filename)
+            self._apply_current_energy()
             self._show_detector_information()
             self._invalidate_detector_sum()
             self._start_detector_mask_update()
@@ -2755,24 +3407,46 @@ class MainWindow(qt.QMainWindow):
         if self.image_data is None:
             self.show_error("Image Required", "Load the sample image before selecting a reference.")
             return
-        filename = self._pick(
-            f"Select {kind.title()} Image", IMAGE_FILTER, use_input_path=True
+        p62_mode = self._measurement_mode if self._beamline == "p62" else None
+        dataset_path = {
+            "saxs": "/scan/data/saxs_raw",
+            "asaxs": "/scan/data/saxs_raw",
+            "waxs": "/scan/data/waxs_raw",
+            "awaxs": "/scan/data/waxs_raw",
+        }.get(p62_mode)
+        filenames, _ = qt.QFileDialog.getOpenFileNames(
+            self,
+            f"Select One or More {kind.title()} Images",
+            self.input_path,
+            P62_IMAGE_FILTER if p62_mode else IMAGE_FILTER,
         )
-        if not filename:
+        if not filenames:
             return
+        self._set_input_path(str(Path(filenames[0]).parent))
         try:
-            reference_sources = expand_image_file(filename)
+            reference_sources = []
+            for filename in filenames:
+                reference_sources.extend(
+                    expand_image_file(filename, dataset_path)
+                )
+            if p62_mode and len(reference_sources) > 1:
+                reference_sources = []
+                for filename in filenames:
+                    reference_sources.extend(
+                        expand_image_file(
+                            filename, dataset_path, include_energy=True
+                        )
+                    )
             # Validate every loaded data file now so a frame-count mismatch is
             # reported before integration or batch export starts.
-            checked_data_files = set()
-            for sample_source in self.image_paths:
-                sample_key = (sample_source.path, sample_source.frame_count)
-                if sample_key in checked_data_files:
-                    continue
-                matching_reference_source(reference_sources, sample_source)
-                checked_data_files.add(sample_key)
+            for sample_index, sample_source in enumerate(self.image_paths):
+                matching_reference_source(
+                    reference_sources, sample_source, self.image_paths,
+                    sample_index,
+                )
             reference_source = matching_reference_source(
-                reference_sources, self.image_paths[self.image_index]
+                reference_sources, self.image_paths[self.image_index],
+                self.image_paths, self.image_index,
             )
             data = read_image(reference_source)
             require_integer_detector_image(data, f"{kind.title()} image")
@@ -2795,13 +3469,16 @@ class MainWindow(qt.QMainWindow):
             key: value for key, value in self._reference_curve_cache.items()
             if key[0] != kind.title()
         }
-        reference_description = Path(filename).name
+        reference_description = Path(filenames[0]).name
+        if len(filenames) > 1:
+            reference_description = f"{len(filenames)} files"
         if len(reference_sources) > 1:
-            reference_description += f" [{len(reference_sources)} frames]"
+            reference_description += f" [{len(reference_sources)} images/frames]"
         getattr(self, f"{kind}_edit").setText(reference_description)
         self.status_label.setText(
             f"{kind.title()} image loaded; select Show or click Integrate"
         )
+        self._update_subtraction_status_block()
 
     @qt.Slot()
     def choose_empty(self):
@@ -2849,6 +3526,7 @@ class MainWindow(qt.QMainWindow):
             payload["corrected"] = corrected
             self._render_integration_payload(payload)
         self.status_label.setText(f"{title} reference cleared")
+        self._update_subtraction_status_block()
 
     @qt.Slot()
     def clear_mask(self):
@@ -2893,6 +3571,7 @@ class MainWindow(qt.QMainWindow):
         if self.image_data is None:
             self.show_error("Image Required", "Select a 2-D diffraction image first.")
             return
+        self._apply_current_energy()
         poni = self.poni_edit.text().strip()
         if not poni or not os.path.isfile(poni):
             self.show_error("PONI File Required", "Select a valid .poni calibration file.")
@@ -2934,7 +3613,6 @@ class MainWindow(qt.QMainWindow):
         self._update_export_progress_block(
             "operation", "Integration", "running…"
         )
-        self._thread = qt.QThread(self)
         cake_cache_key = self._cake_cache_key(radial_range, azimuth_range)
         # IntegrationWorker performs pyFAI 1-D integration and optional Cake /
         # reference work only. Detector Sum and ROI Sum are never calculated
@@ -2949,6 +3627,23 @@ class MainWindow(qt.QMainWindow):
             if self.cake_check.isChecked() else None,
             cake_cache_key,
         )
+        if self._exporting_video:
+            payloads = []
+            errors = []
+            self._worker.finished.connect(payloads.append)
+            self._worker.failed.connect(errors.append)
+            self._worker.run()
+            self._worker = None
+            if errors:
+                qt.QTimer.singleShot(
+                    0, lambda error=errors[-1]: self.integration_failed(error)
+                )
+            elif payloads:
+                qt.QTimer.singleShot(
+                    0, lambda payload=payloads[-1]: self.integration_finished(payload)
+                )
+            return
+        self._thread = qt.QThread(self)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.finished.connect(self._integration_worker_succeeded)
@@ -3138,7 +3833,8 @@ class MainWindow(qt.QMainWindow):
             list(self.image_paths), output_dir, poni, self.mask_data,
             self.points_spin.value(), self.unit_combo.currentText(), radial_range,
             azimuth_range,
-            references,
+            references, self._measurement_mode in ("asaxs", "awaxs"),
+            self._measurement_mode == "asaxs",
         )
         self._batch_worker.moveToThread(self._batch_thread)
         self._batch_thread.started.connect(self._batch_worker.run)
@@ -3170,9 +3866,15 @@ class MainWindow(qt.QMainWindow):
 
     @qt.Slot(int, int, str)
     def _batch_data_progress(self, current, total, filename):
-        self.status_label.setText(f"Saving {current} of {total}: {filename}")
-        self._update_export_progress_block(
-            f"data:{filename}", filename, f"file [{current}/{total}]"
+        source_progress = self._source_file_frame_progress(
+            self.image_paths, current - 1
+        )
+        self.status_label.setText(
+            f"Saving [{current}/{total}]; {source_progress}"
+        )
+        self._update_subtraction_status_block(current - 1)
+        self._update_scrolling_filename(
+            self.image_paths[current - 1], "data"
         )
 
     @qt.Slot(str, int)
@@ -3191,6 +3893,16 @@ class MainWindow(qt.QMainWindow):
         error = self._batch_worker_error
         self._batch_worker_result = None
         self._batch_worker_error = None
+        # Keep the Python wrappers alive until Qt has processed deleteLater for
+        # both objects. Dropping the last wrapper inside QThread.finished can
+        # destroy a QObject while Qt is still dispatching its final signals.
+        qt.QTimer.singleShot(
+            50, lambda result=result, error=error: self._finalize_batch_thread(
+                result, error
+            )
+        )
+
+    def _finalize_batch_thread(self, result, error):
         self._batch_worker = None
         self._batch_thread = None
         if self._operation_cancel_requested:
@@ -3301,6 +4013,13 @@ class MainWindow(qt.QMainWindow):
         self.save_ascii_video_action.setEnabled(False)
         self.integrate_button.setEnabled(False)
         self.image_index = 0
+        saving_current, saving_total = self._video_saving_position(
+            self.image_paths[0]
+        )
+        self._update_video_status(
+            f"Saving [{saving_current}/{saving_total}]; "
+            f"{self._source_file_frame_progress(self.image_paths, 0)}",
+        )
         self._load_current_image()
 
     @qt.Slot()
@@ -3454,9 +4173,12 @@ class MainWindow(qt.QMainWindow):
         image = self._grab_combined_plots().convertToFormat(qt.QImage.Format_RGB888)
         width, height = image.width(), image.height()
         bytes_per_line = image.bytesPerLine()
-        ptr = image.bits()
-        ptr.setsize(height * bytes_per_line)
-        frame = np.frombuffer(ptr, dtype=np.uint8).reshape(height, bytes_per_line)
+        # Copy through Qt's bounded API. Resizing the sip.voidptr returned by
+        # bits() can trigger Qt6Core's 0xc0000409 native buffer-overrun abort.
+        image_bytes = image.constBits().asstring(height * bytes_per_line)
+        frame = np.frombuffer(image_bytes, dtype=np.uint8).reshape(
+            height, bytes_per_line
+        )
         frame = frame[:, : width * 3].reshape(height, width, 3).copy()
         # H.264/yuv420 requires even dimensions. Pad instead of resizing the GUI.
         pad_height = height % 2
@@ -3476,23 +4198,26 @@ class MainWindow(qt.QMainWindow):
         total = len(self.image_paths)
         source = self.image_paths[self.image_index]
         source_path = source.path if isinstance(source, ImageSource) else str(source)
-        source_label = Path(source_path).stem
-        if isinstance(source, ImageSource) and source.frame is not None:
-            frame_current = source.frame + 1
-            frame_total = source.frame_count
-        else:
-            frame_current = current
-            frame_total = total
-        self._update_export_progress_block(
-            f"video:{source_path}", source_label,
-            f"frame [{frame_current}/{frame_total}]",
+        source_progress = self._source_file_frame_progress(
+            self.image_paths, self.image_index
         )
+        saving_current, saving_total = self._video_saving_position(source)
+        self._update_video_status(
+            f"Saving [{saving_current}/{saving_total}]; {source_progress}",
+        )
+        self._update_subtraction_status_block(self.image_index)
+        self._update_scrolling_filename(source, "video")
         if current == total:
             self._update_export_progress_block(
                 f"complete:{self._video_progress_key}",
                 self._video_progress_key,
                 f"complete [{total}/{total}]",
             )
+        # Video export is sequential. Retaining per-source Cake payloads gives
+        # no benefit and can exhaust memory for large detector stacks.
+        self._last_integration_payload = None
+        self._cake_cache.clear()
+        del frame, image_bytes, image
         if self.image_index + 1 < len(self.image_paths):
             self.image_index += 1
             self._load_current_image()
@@ -3555,6 +4280,12 @@ class MainWindow(qt.QMainWindow):
         error = self._integration_worker_error
         self._integration_worker_payload = None
         self._integration_worker_error = None
+        qt.QTimer.singleShot(
+            50, lambda payload=payload, error=error:
+            self._finalize_integration_thread(payload, error)
+        )
+
+    def _finalize_integration_thread(self, payload, error):
         self._worker = None
         self._thread = None
         if self._operation_cancel_requested:
@@ -3575,7 +4306,9 @@ class MainWindow(qt.QMainWindow):
         if payload.get("cake") is not None:
             self._cake_cache[payload["cake_cache_key"]] = payload["cake"]
         for name, cache_key in payload.get("reference_cache_keys", {}).items():
-            self._reference_curve_cache[cache_key] = payload["references"][name][0]
+            self._reference_curve_cache[cache_key] = payload.get(
+                "reference_cache_values", {}
+            ).get(name, payload["references"][name][0])
         self._render_integration_payload(payload)
         # Scale only after every selected curve has been added. Scaling when the
         # Data curve is added would omit a later Subtracted data curve.
@@ -3584,7 +4317,10 @@ class MainWindow(qt.QMainWindow):
         self.result_plot.resetZoom()
         radial = payload["radial"]
         self.integrate_button.setEnabled(True)
-        self.status_label.setText(f"Integration complete: {len(radial):,} data points")
+        self.status_label.setText(
+            f"Integration complete: {len(radial):,} data points"
+        )
+        self._update_subtraction_status_block()
         self._update_export_progress_block(
             "operation", "Integration", f"complete ({len(radial):,} points)"
         )
