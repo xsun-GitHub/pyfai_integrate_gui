@@ -3207,13 +3207,22 @@ class MainWindow(qt.QMainWindow):
 
     def _select_p62_mode(self, mode):
         self._measurement_mode = mode
-        if mode in ("saxs", "asaxs"):
-            # SAXS curves span several decades on both axes. Match the usual
-            # beamline view as soon as either SAXS mode is selected.
-            self.result_log_x_action.setChecked(True)
-            self.result_log_y_action.setChecked(True)
+        self._apply_p62_result_scale()
         self.status_label.setText(f"p62 mode: {mode.upper()}")
         self._apply_current_energy()
+
+    def _apply_p62_result_scale(self):
+        """Keep the SAXS action state and actual 1-D axes in log-log mode."""
+        if self._beamline != "p62" or self._measurement_mode not in (
+            "saxs", "asaxs"
+        ):
+            return
+        # QAction.setChecked alone does not reliably execute silx's scale
+        # change handler. Set the axes explicitly, then synchronize the actions.
+        self.result_log_x_action.setChecked(True)
+        self.result_log_y_action.setChecked(True)
+        self._shared_log_x_changed(True)
+        self.result_plot.getYAxis().setScale("log")
 
     def _current_energy_ev(self):
         if (
@@ -4539,6 +4548,9 @@ class MainWindow(qt.QMainWindow):
         for curve in self.result_plot.getAllCurves():
             curve.sigItemChanged.connect(self._result_curve_changed)
         self._refresh_result_legend()
+        # clear()/addCurve() can leave a programmatically checked silx action
+        # out of sync with its axis. Reapply after every integration redraw.
+        self._apply_p62_result_scale()
 
     def _render_cake_image(self, payload, resetzoom):
         """Render Cake with a strictly positive X extent on a logarithmic axis."""
