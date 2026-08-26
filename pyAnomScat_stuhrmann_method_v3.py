@@ -1,29 +1,19 @@
 import sys
-from turtle import width
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QMenu, QFileDialog
 from PyQt6 import uic
-import glob
 import os
 import numpy as np
-import subprocess
-import time
-import shutil
 import pyqtgraph as pg
-import threading
-import warnings
 import re
 from scanf import scanf 
 import xraydb
 
-warnings.filterwarnings('ignore')
-
 # globel parameters that can be modified later or recovered later
 param = dict()
 param['energy resolution'] = 1.4e-4   # Si 111
-param['test'] = True
 param['energy_offset_momo'] = 3.0     # eV offset between recorded energy and real energy in eV
 param['import_ascii_delimiter']=None
 param['import_ascii_comments']='#'
@@ -477,7 +467,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         result = float(result[-1]) 
                     else:
                         result = 0.0
-                except:
+                except (TypeError, ValueError):
                     result = 0.0    # set default energy to zero to make the user aware of  the missing energy information
                 if result == 0.0:
                     try:
@@ -496,11 +486,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 try:
                     source_header, q_unit, has_error = self._read_curve_header(item)
                     data = np.loadtxt(item,delimiter=param['import_ascii_delimiter'],comments=param['import_ascii_comments'])
-                    self.curves.append(np.array(data))
+                    data = np.asarray(data)
+                    if data.ndim != 2 or data.shape[1] < 2:
+                        raise ValueError("ASCII curve must contain at least two columns")
+                    self.curves.append(data)
                     self.curve_headers.append(source_header)
                     self.curve_units.append(q_unit)
                     self.curve_has_error.append(has_error and data.shape[1] >= 3)
-                except:
+                except (OSError, TypeError, ValueError, IndexError):
                     continue
                 
                 # get color
@@ -636,7 +629,7 @@ class MainWindow(QtWidgets.QMainWindow):
         elif c == 8:
             # color choose
             color = QtWidgets.QColorDialog.getColor()
-            if color.isValid:
+            if color.isValid():
                 self.tableModel.setAt(r,c,color.name().upper())
                 self.updatePlotWidget1()
         elif c == 13:
@@ -805,18 +798,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.factors['nrj_real'] = nrj_real
         self.factors['nrj_chem'] = nrj_chem
 
-        try:
-            feff_use = np.interp(nrj_chem, X,feff)
-        
-            f1_use = np.interp(nrj_chem,X,conv_f1[50:-50])
-            f2_use = np.interp(nrj_chem,X,conv_f2[50:-50])
+        feff_use = np.interp(nrj_chem, X,feff)
+        f1_use = np.interp(nrj_chem,X,conv_f1[50:-50])
+        f2_use = np.interp(nrj_chem,X,conv_f2[50:-50])
 
-            self.factors['feff_use'] = feff_use[:]
-            self.factors['f1_use'] = f1_use[:]
-            self.factors['f2_use'] = f2_use[:]
-            self.factors['index_use']=index_use
-        except:
-            pass
+        self.factors['feff_use'] = feff_use[:]
+        self.factors['f1_use'] = f1_use[:]
+        self.factors['f2_use'] = f2_use[:]
+        self.factors['index_use']=index_use
 
         # update table model
         for i in range(0,self.tableModel.rowCount()):
@@ -851,34 +840,17 @@ class MainWindow(QtWidgets.QMainWindow):
         cc = self.tableModel.get(0,5)
         p.plot(self.factors['nrj_all'],self.factors['feff_raw'],pen='g')
         p.plot(self.factors['nrj_all'],self.factors['feff_all'],pen='r')
-        #print(self.factors['nrj_real'])
-        #print(self.factors['feff_use'])
-        #print(index_use)
-        try:
+        if 'feff_use' in self.factors and self.tableModel.rowCount() > 0:
             p.plot(self.factors['nrj_real'][index_use]+cc,self.factors['feff_use'][index_use],pen=None, symbolBrush = param['feff_plot_color'],symbolPen = 'w', symbol = 'o', symbolSize=14)
-            #for i in range(0,self.tableModel.rowCount()):
-                #self.tableModel.get(i,7)
-                #p.plot(self.factors['nrj_real'][index_use],self.factors['feff_use'][index_use],pen=None, symbolBrush = param['feff_plot_color'],symbolPen = 'w', symbol = 'o', symbolSize=14)
-                #for i in index_use:
-                #   print('hier')
-                #    print(self.factors['nrj_real'][i])
-                #    print(self.factors['feff_use'][i])
-                #    p.plot(self.factors['nrj_real'][i],self.factors['feff_use'][i],pen=None, symbolBrush = param['feff_plot_color'], symbolPen = 'w' , symbol = 'o', symbolSize=14)
-        except:
-            pass
         self._auto_scale_plot(p)
 
 
     def runMatrixVersion(self):
         index_use = list()
-        f0 = list()
         for i in range(0,self.tableModel.rowCount()):
             if self.tableModel.get(i,9):
                 index_use.append(i)
-                f0.append(self.factors['f0_all'][0])
-        
-        #index_use = np.flip(np.array(index_use))
-        f0 = np.array(f0)
+
         f1 = self.factors['f1_use'][index_use]
         f2 = self.factors['f2_use'][index_use] 
 
@@ -889,88 +861,47 @@ class MainWindow(QtWidgets.QMainWindow):
         # files may be selected together and can have different shapes.
         use_errors = all(self.curve_has_error[item] for item in index_use)
         q1 = curves[0][:,0]
-        q2 = curves[1][:,0]
-        q3 = curves[2][:,0]
-        i1 = curves[0][:,1]
-        i2 = curves[1][:,1]
-        i3 = curves[2][:,1]
-        #print(f0)
-        #print(f1)
-        #print(f2)
-        
+
         p = self.plotWidget[1]
         p.clear()
         self._update_q_axis_labels(index_use[0] if index_use else 0)
-        #p.plot(q1,i1)
-        #p.plot(q2,i2)
-        #p.plot(q3,i3)
 
-        # now apply the equations for the resonant curve
-        i12 = i1-i2
-        i13 = i1-i3
+        point_counts = {curve.shape[0] for curve in curves}
+        if len(point_counts) != 1:
+            QtWidgets.QMessageBox.warning(
+                self, 'Incompatible curves',
+                'All selected curves must contain the same number of q points.'
+            )
+            return
+        if not all(np.allclose(curve[:, 0], q1) for curve in curves[1:]):
+            QtWidgets.QMessageBox.warning(
+                self, 'Incompatible curves',
+                'All selected curves must use the same q grid.'
+            )
+            return
 
-        f1_12 = f1[0]-f1[1]
-        f1_13 = f1[0]-f1[2]
-        K = f1[1]-f1[2] + (f2[0]**2-f2[1]**2)/f1_12 - (f2[0]**2-f2[2]**2)/f1_13
-        t1 = (i12)/f1_12
-        t2 = (i13)/f1_13
-        #v2 = 1.0/K * ((i12)/f1_12 - (i13)/f1_13)
-        #if K > 0:
-        #    v2 = 1.0/K * (t2-t1)    
-        #else:
-        v2 = 1.0/K * (t1-t2)
-        #print(K)
-        #print(t1-t2)
-                
-        #p.plot(q1,np.abs(v2),pen='r')
+        matA = np.column_stack((
+            np.ones(len(f1)),
+            2.0 * f1,
+            f1 ** 2 + f2 ** 2,
+        ))
+        intensities = np.column_stack([curve[:, 1] for curve in curves])
 
-        # try with the matrix version
-        # Edit's my Martin Fisk's group below here
-        matA = np.zeros((len(f1),3))
-        I_E = np.zeros((len(q1),len(f1)))
-        for i in range(len(f1)):
-            I_E[:,i] = curves[i][:,1]
-            matA[i,0] = 1.0
-            matA[i,1] = 2.0*f1[i]
-            matA[i,2] = f1[i]**2 + f2[i]**2
+        # Compute every q point in one LAPACK call. Weighted points are then
+        # replaced individually because their design matrix depends on Sigma.
+        solutions = np.linalg.lstsq(matA, intensities.T, rcond=None)[0]
+        if use_errors:
+            sigmas = np.column_stack([curve[:, 2] for curve in curves])
+            valid_error_rows = np.all(np.isfinite(sigmas) & (sigmas > 0), axis=1)
+            for point_index in np.flatnonzero(valid_error_rows):
+                weights = 1.0 / sigmas[point_index]
+                solutions[:, point_index] = np.linalg.lstsq(
+                    matA * weights[:, np.newaxis],
+                    intensities[point_index] * weights,
+                    rcond=None,
+                )[0]
 
-        #matA[0,0] = 1.0
-        #matA[0,1] = 2.0*f1[0]
-        #matA[0,2] = f1[0]**2 + f2[0]**2
-        #matA[1,0] = 1.0
-        #matA[1,1] = 2.0*f1[1]
-        #matA[1,2] = f1[1]**2 + f2[1]**2
-        #matA[2,0] = 1.0
-        #matA[2,1] = 2.0*f1[2]
-        #matA[2,2] = f1[2]**2 + f2[2]**2
-
-        I0 = np.copy(q1)
-        I0R = np.copy(q1)
-        IR = np.copy(q1)
-
-
-        for i, q in enumerate(q1):
-            #y = [i1[i],i2[i],i3[i]]
-            y= I_E[i,:]
-
-            #x = np.linalg.solve(matA,y)
-            if use_errors:
-                sigma = np.asarray([curve[i, 2] for curve in curves])
-                valid_sigma = np.all(np.isfinite(sigma)) and np.all(sigma > 0)
-            else:
-                valid_sigma = False
-            if valid_sigma:
-                weights = 1.0 / sigma
-                res = np.linalg.lstsq(
-                    matA * weights[:, np.newaxis], y * weights, rcond=None
-                )
-            else:
-                res = np.linalg.lstsq(matA, y, rcond=None)
-            x = res[0]
-            #print(x)
-            I0[i] = x[0]
-            I0R[i] = x[1]
-            IR[i] = x[2]
+        I0, I0R, IR = solutions
         
         # Three distinct result colors, each one width step thicker than the
         # previous default-width curves for clearer comparison.
@@ -983,9 +914,6 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._auto_scale_plot(p)
 
-        #Icheck = np.sqrt(np.abs(I0))*np.sqrt(np.abs(IR))
-        #p.plot(q1,Icheck,pen=pg.mkPen('#FF44F4', style=QtCore.Qt.DotLine))
-        #p.plot(q1,np.abs(I0R-Icheck),pen=pg.mkPen('#0344F4', style=QtCore.Qt.DotLine))
         self.result = dict()
         self.result['q'] = q1[:]
         self.result['I0'] = np.abs(I0[:])
@@ -1079,13 +1007,10 @@ class TableModelContent(QtCore.QAbstractTableModel):
             if index.column() == 4 or index.column()==5:
                 try:
                     self._data[index.row()][index.column()] = float(value)
-                except:
+                except (TypeError, ValueError):
                     return False
             elif index.column() == 8:
-                try:
-                    self._data[index.row()][index.column()] = value
-                except:
-                    return False
+                self._data[index.row()][index.column()] = value
             self.layoutChanged.emit()
             return True
         return False       
@@ -1115,21 +1040,12 @@ class TableModelContent(QtCore.QAbstractTableModel):
     def get(self, row, col):
         return self._data[row][col]
 
-    def getColumnValues(self, row):
-        col = range(0,self.columnCount())
-        cell = []
-        cell = [self._data[row][c] for c in col]
-        return cell
-
     def set(self, data):
         self._data = data
         self.layoutChanged.emit()
     
     def rowCount(self,index=None):
-        try:
-            return len(self._data)
-        except:
-            return 0
+        return len(self._data)
     
     def columnCount(self, index=None):
         return len(self._header)
