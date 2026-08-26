@@ -860,38 +860,70 @@ class MainWindow(QtWidgets.QMainWindow):
         # Keep curves as a list: two-column and Sigma-bearing three-column
         # files may be selected together and can have different shapes.
         use_errors = all(self.curve_has_error[item] for item in index_use)
-        q1 = curves[0][:,0]
 
         p = self.plotWidget[1]
         p.clear()
         self._update_q_axis_labels(index_use[0] if index_use else 0)
 
-        point_counts = {curve.shape[0] for curve in curves}
-        if len(point_counts) != 1:
+        selected_units = {self.curve_units[item] for item in index_use}
+        if len(selected_units) != 1:
             QtWidgets.QMessageBox.warning(
                 self, 'Incompatible curves',
-                'All selected curves must contain the same number of q points.'
+                'All selected curves must use the same q unit.'
             )
             return
-        if not all(np.allclose(curve[:, 0], q1) for curve in curves[1:]):
+
+        # ASAXS updates the wavelength for each energy, so pyFAI naturally
+        # produces slightly different q grids. Compare the curves only over
+        # their common q range and interpolate them onto the first curve's grid.
+        sorted_curves = []
+        for curve in curves:
+            order = np.argsort(curve[:, 0])
+            sorted_curve = curve[order]
+            unique_q, unique_indices = np.unique(
+                sorted_curve[:, 0], return_index=True
+            )
+            sorted_curves.append(sorted_curve[unique_indices])
+        common_q_min = max(curve[0, 0] for curve in sorted_curves)
+        common_q_max = min(curve[-1, 0] for curve in sorted_curves)
+        if not np.isfinite(common_q_min) or not np.isfinite(common_q_max) \
+                or common_q_min >= common_q_max:
             QtWidgets.QMessageBox.warning(
                 self, 'Incompatible curves',
-                'All selected curves must use the same q grid.'
+                'The selected curves do not have an overlapping q range.'
             )
             return
+
+        first_q = sorted_curves[0][:, 0]
+        q1 = first_q[(first_q >= common_q_min) & (first_q <= common_q_max)]
+        if q1.size < 3:
+            QtWidgets.QMessageBox.warning(
+                self, 'Incompatible curves',
+                'The common q range contains fewer than three points.'
+            )
+            return
+
+        intensities = np.column_stack([
+            np.interp(q1, curve[:, 0], curve[:, 1])
+            for curve in sorted_curves
+        ])
+        sigmas = None
+        if use_errors:
+            sigmas = np.column_stack([
+                np.interp(q1, curve[:, 0], curve[:, 2])
+                for curve in sorted_curves
+            ])
 
         matA = np.column_stack((
             np.ones(len(f1)),
             2.0 * f1,
             f1 ** 2 + f2 ** 2,
         ))
-        intensities = np.column_stack([curve[:, 1] for curve in curves])
 
         # Compute every q point in one LAPACK call. Weighted points are then
         # replaced individually because their design matrix depends on Sigma.
         solutions = np.linalg.lstsq(matA, intensities.T, rcond=None)[0]
         if use_errors:
-            sigmas = np.column_stack([curve[:, 2] for curve in curves])
             valid_error_rows = np.all(np.isfinite(sigmas) & (sigmas > 0), axis=1)
             for point_index in np.flatnonzero(valid_error_rows):
                 weights = 1.0 / sigmas[point_index]
@@ -925,12 +957,12 @@ class MainWindow(QtWidgets.QMainWindow):
         f1_res = list()
         f2_res = list()
         feff_res = list()
-        for i, item in enumerate(index_use):
-            fname.append(self.tableModel.get(i,2))
-            nrj.append(self.tableModel.get(i,6))
-            f1_res.append(self.tableModel.get(i,10))
-            f2_res.append(self.tableModel.get(i,11))
-            feff_res.append(self.tableModel.get(i,12))
+        for item in index_use:
+            fname.append(self.tableModel.get(item,2))
+            nrj.append(self.tableModel.get(item,6))
+            f1_res.append(self.tableModel.get(item,10))
+            f2_res.append(self.tableModel.get(item,11))
+            feff_res.append(self.tableModel.get(item,12))
 
         self.result['files'] = fname
         self.result['nrj'] = nrj
