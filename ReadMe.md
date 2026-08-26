@@ -52,6 +52,8 @@ python pyfai_integrate_gui_v3.py
 - Calculates a masked detector intensity sum using an `int64` accumulator.
 - Optionally displays a pyFAI azimuthal-versus-radial Cake plot.
 - Saves current plots, tab-separated ASCII data, and grouped MP4 videos.
+- **Save -> Batch Plots** selects one export folder and saves one PNG for every
+  selected image/frame without writing ASCII data or creating videos.
 - Keeps separate persistent Input and Export paths under **File -> Path**.
 - **Options -> Plot NeXus** browses numeric datasets, assigns X/Y, plots
   matching arrays, and optionally displays `dY/dX`.

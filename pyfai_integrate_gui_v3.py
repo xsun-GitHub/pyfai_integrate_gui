@@ -122,6 +122,7 @@ MAX_DISPLAY_DIMENSION = 1200
 # the bare string "histogram" resolves to the NumPy/Python implementation,
 # which allocates detector-sized float64 temporary arrays.
 INTEGRATION_METHOD_1D = "histogram"
+INTEGRATION_METHOD_1D_ERROR = ("no", "histogram", "cython")
 INTEGRATION_METHOD_2D = ("no", "histogram", "cython")
 
 
@@ -463,7 +464,8 @@ class IntegrationWorker(qt.QObject):
 
     def __init__(
         self, image, integrator, mask, points, unit, radial_range,
-        azimuth_range, references, calculate_cake, cached_cake, cake_cache_key,
+        azimuth_range, error_model, references, calculate_cake, cached_cake,
+        cake_cache_key,
     ):
         super().__init__()
         self.image = image
@@ -473,6 +475,7 @@ class IntegrationWorker(qt.QObject):
         self.unit = unit
         self.radial_range = radial_range
         self.azimuth_range = azimuth_range
+        self.error_model = error_model
         self.references = references
         self.calculate_cake = calculate_cake
         self.cached_cake = cached_cake
@@ -497,12 +500,20 @@ class IntegrationWorker(qt.QObject):
                 unit=self.unit,
                 radial_range=self.radial_range,
                 azimuth_range=self.azimuth_range,
-                method=INTEGRATION_METHOD_1D,
+                method=(
+                    INTEGRATION_METHOD_1D_ERROR
+                    if self.error_model is not None else INTEGRATION_METHOD_1D
+                ),
                 correctSolidAngle=True,
+                error_model=self.error_model,
             )
             payload = {
                 "radial": np.asarray(result.radial),
                 "sample": np.asarray(result.intensity),
+                "sigma": (
+                    None if self.error_model is None or result.sigma is None
+                    else np.asarray(result.sigma)
+                ),
                 "unit": str(result.unit),
                 "references": {},
                 "reference_cache_keys": {},
@@ -517,26 +528,41 @@ class IntegrationWorker(qt.QObject):
                     ref_result = self.integrator.integrate1d(
                         data, self.points, mask=self.mask, unit=self.unit,
                         radial_range=self.radial_range,
-                        method=INTEGRATION_METHOD_1D,
+                        method=(
+                            INTEGRATION_METHOD_1D_ERROR
+                            if self.error_model is not None else INTEGRATION_METHOD_1D
+                        ),
                         azimuth_range=self.azimuth_range,
                         correctSolidAngle=True,
+                        error_model=self.error_model,
                     )
                     ref_radial = np.asarray(ref_result.radial)
                     intensity = np.asarray(ref_result.intensity)
+                    sigma = (
+                        None if self.error_model is None or ref_result.sigma is None
+                        else np.asarray(ref_result.sigma)
+                    )
                 else:
-                    if isinstance(cached, tuple) and len(cached) == 2:
+                    if isinstance(cached, tuple) and len(cached) == 3:
+                        ref_radial, intensity, sigma = cached
+                    elif isinstance(cached, tuple) and len(cached) == 2:
                         ref_radial, intensity = cached
+                        sigma = None
                     else:
                         ref_radial, intensity = payload["radial"], cached
+                        sigma = None
                     ref_radial = np.asarray(ref_radial)
                     intensity = np.asarray(intensity)
                 reference_results.append((
-                    name, ref_radial, intensity, show, subtract, factor, cache_key
+                    name, ref_radial, intensity, sigma, show, subtract, factor,
+                    cache_key
                 ))
                 payload["reference_cache_keys"][name] = cache_key
-                payload["reference_cache_values"][name] = (ref_radial, intensity)
+                payload["reference_cache_values"][name] = (
+                    ref_radial, intensity, sigma
+                )
             common = np.ones(payload["radial"].shape, dtype=bool)
-            for _name, ref_radial, _intensity, _show, subtract, _factor, _key in reference_results:
+            for _name, ref_radial, _intensity, _sigma, _show, subtract, _factor, _key in reference_results:
                 if subtract:
                     common &= (
                         (payload["radial"] >= np.min(ref_radial))
@@ -546,15 +572,31 @@ class IntegrationWorker(qt.QObject):
                 raise ValueError("Sample and reference curves have no common q range")
             payload["radial"] = payload["radial"][common]
             payload["sample"] = payload["sample"][common]
+            if payload["sigma"] is not None:
+                payload["sigma"] = payload["sigma"][common]
             corrected = payload["sample"].copy()
-            for name, ref_radial, intensity, show, subtract, factor, _key in reference_results:
+            corrected_variance = (
+                None if payload["sigma"] is None else payload["sigma"] ** 2
+            )
+            for name, ref_radial, intensity, sigma, show, subtract, factor, _key in reference_results:
                 if ref_radial[0] > ref_radial[-1]:
                     ref_radial, intensity = ref_radial[::-1], intensity[::-1]
+                    if sigma is not None:
+                        sigma = sigma[::-1]
                 aligned = np.interp(payload["radial"], ref_radial, intensity)
                 payload["references"][name] = (aligned, show, subtract, factor)
                 if subtract:
                     corrected -= factor * aligned
+                    if corrected_variance is not None and sigma is not None:
+                        aligned_sigma = np.interp(
+                            payload["radial"], ref_radial, sigma
+                        )
+                        corrected_variance += (factor * aligned_sigma) ** 2
             payload["corrected"] = corrected
+            payload["corrected_sigma"] = (
+                None if corrected_variance is None
+                else np.sqrt(corrected_variance)
+            )
             # Cake is deliberately last: all 1-D and subtraction work finishes
             # before the higher-memory 2-D integration starts.
             if self.calculate_cake and payload["cake"] is None:
@@ -711,7 +753,7 @@ class BatchIntegrationWorker(qt.QObject):
 
     def __init__(
         self, paths, output_dir, poni, user_mask, points, unit, radial_range,
-        azimuth_range,
+        azimuth_range, error_model,
         references=None, use_source_energy=False,
         include_energy_in_filename=False,
     ):
@@ -724,6 +766,7 @@ class BatchIntegrationWorker(qt.QObject):
         self.unit = unit
         self.radial_range = radial_range
         self.azimuth_range = azimuth_range
+        self.error_model = error_model
         self.references = references or []
         self.use_source_energy = use_source_energy
         self.include_energy_in_filename = include_energy_in_filename
@@ -790,12 +833,20 @@ class BatchIntegrationWorker(qt.QObject):
                 mask_key = (shape_key, mask_checksum(mask))
                 result = integrator.integrate1d(
                     image, self.points, mask=mask, unit=self.unit,
-                    radial_range=self.radial_range, method=INTEGRATION_METHOD_1D,
+                    radial_range=self.radial_range,
+                    method=(
+                        INTEGRATION_METHOD_1D_ERROR
+                        if self.error_model is not None else INTEGRATION_METHOD_1D
+                    ),
                     azimuth_range=self.azimuth_range,
                     correctSolidAngle=True,
+                    error_model=self.error_model,
                 )
                 columns = [result.radial, result.intensity]
                 column_names = [str(result.unit), "Intensity"]
+                if self.error_model is not None and result.sigma is not None:
+                    columns.append(result.sigma)
+                    column_names.append("Sigma")
                 comments = []
                 if isinstance(path, ImageSource) and path.energy_ev is not None:
                     comments.append(f"Energy: {path.energy_ev} eV")
@@ -843,9 +894,14 @@ class BatchIntegrationWorker(qt.QObject):
                         ref_result = integrator.integrate1d(
                             ref_data, self.points, mask=mask, unit=self.unit,
                             radial_range=self.radial_range,
-                            method=INTEGRATION_METHOD_1D,
+                            method=(
+                                INTEGRATION_METHOD_1D_ERROR
+                                if self.error_model is not None
+                                else INTEGRATION_METHOD_1D
+                            ),
                             azimuth_range=self.azimuth_range,
                             correctSolidAngle=True,
+                            error_model=self.error_model,
                         )
                         reference_curve = (
                             np.asarray(ref_result.radial),
@@ -1452,6 +1508,10 @@ class MainWindow(qt.QMainWindow):
         self._plot_export_original_auto = False
         self._plot_export_current_filename = ""
         self._exporting_plot = False
+        self._batch_plot_only = False
+        self._batch_plot_output_dir = ""
+        self._batch_plot_total = 0
+        self._batch_plot_current = 0
         self._last_integration_payload = None
         self._cake_cache = {}
         self._cake_log_mesh = None
@@ -1480,10 +1540,12 @@ class MainWindow(qt.QMainWindow):
         file_menu.addSeparator()
         save_menu = file_menu.addMenu("Save")
         self.save_current_action = save_menu.addAction("Plot (current view)")
+        self.save_batch_plots_action = save_menu.addAction("Batch Plots")
         self.save_batch_video_action = save_menu.addAction("Batch Video")
         self.save_data_action = save_menu.addAction("ASCII (all integrated data)")
         self.save_ascii_video_action = save_menu.addAction("Data and Plots")
         self.save_current_action.triggered.connect(self.save_current_view)
+        self.save_batch_plots_action.triggered.connect(self.save_batch_plots)
         self.save_batch_video_action.triggered.connect(self.save_batch_videos)
         self.save_data_action.triggered.connect(self.save_all_integrated_data)
         self.save_ascii_video_action.triggered.connect(self.save_data_and_plots)
@@ -1635,6 +1697,7 @@ class MainWindow(qt.QMainWindow):
     def _set_save_actions_enabled(self, enabled):
         for action in (
             self.save_current_action,
+            self.save_batch_plots_action,
             self.save_batch_video_action,
             self.save_data_action,
             self.save_ascii_video_action,
@@ -1745,6 +1808,15 @@ class MainWindow(qt.QMainWindow):
         self.points_spin.setValue(1000)
         self.unit_combo = qt.QComboBox()
         self.unit_combo.addItems(["q_A^-1", "q_nm^-1", "2th_deg", "2th_rad", "r_mm"])
+        self.error_model_combo = qt.QComboBox()
+        self.error_model_combo.addItem("No error", None)
+        self.error_model_combo.addItem("Poisson", "poisson")
+        self.error_model_combo.addItem("Azimuthal", "azimuthal")
+        self.error_model_combo.addItem("Hybrid", "hybrid")
+        self.error_model_combo.setToolTip(
+            "pyFAI error model. When enabled, integrated ASCII files contain "
+            "a third column named Sigma."
+        )
         self.radial_range_edit = qt.QLineEdit()
         self.azimuth_range_edit = qt.QLineEdit()
         for edit in (self.radial_range_edit, self.azimuth_range_edit):
@@ -1752,6 +1824,7 @@ class MainWindow(qt.QMainWindow):
             edit.setToolTip("minimum, maximum")
         form.addRow("Number of points", self.points_spin)
         form.addRow("X-axis unit", self.unit_combo)
+        form.addRow("Error model", self.error_model_combo)
         form.addRow("Radial range", self.radial_range_edit)
         form.addRow("Azimuthal range (deg)", self.azimuth_range_edit)
         self.cake_check = qt.QCheckBox("Cake")
@@ -2513,6 +2586,7 @@ class MainWindow(qt.QMainWindow):
             return
         if self._exporting_plot:
             self._exporting_plot = False
+            self._batch_plot_only = False
             self._restore_plot_export_state()
 
     def _operation_stopped(self):
@@ -2630,7 +2704,7 @@ class MainWindow(qt.QMainWindow):
         image_shape = None if self.image_data is None else tuple(self.image_data.shape)
         return (
             name, os.path.abspath(ref_source.path), ref_source.frame,
-            reference_mtime, image_shape
+            reference_mtime, image_shape, self._error_model()
         ) + cake_context[1:]
 
     def _reset_export_progress(self):
@@ -3133,6 +3207,11 @@ class MainWindow(qt.QMainWindow):
 
     def _select_p62_mode(self, mode):
         self._measurement_mode = mode
+        if mode in ("saxs", "asaxs"):
+            # SAXS curves span several decades on both axes. Match the usual
+            # beamline view as soon as either SAXS mode is selected.
+            self.result_log_x_action.setChecked(True)
+            self.result_log_y_action.setChecked(True)
         self.status_label.setText(f"p62 mode: {mode.upper()}")
         self._apply_current_energy()
 
@@ -3566,6 +3645,10 @@ class MainWindow(qt.QMainWindow):
             self._optional_range(self.azimuth_range_edit, "azimuthal range"),
         )
 
+    def _error_model(self):
+        """Return pyFAI's error-model token, or None when errors are disabled."""
+        return self.error_model_combo.currentData()
+
     @qt.Slot()
     def start_integration(self):
         if self.image_data is None:
@@ -3620,7 +3703,7 @@ class MainWindow(qt.QMainWindow):
         self._worker = IntegrationWorker(
             self.image_data, self.integrator, self._effective_mask(),
             self.points_spin.value(), self.unit_combo.currentText(), radial_range,
-            azimuth_range,
+            azimuth_range, self._error_model(),
             references,
             self.cake_check.isChecked(),
             self._cake_cache.get(cake_cache_key)
@@ -3832,7 +3915,7 @@ class MainWindow(qt.QMainWindow):
         self._batch_worker = BatchIntegrationWorker(
             list(self.image_paths), output_dir, poni, self.mask_data,
             self.points_spin.value(), self.unit_combo.currentText(), radial_range,
-            azimuth_range,
+            azimuth_range, self._error_model(),
             references, self._measurement_mode in ("asaxs", "awaxs"),
             self._measurement_mode == "asaxs",
         )
@@ -3853,6 +3936,7 @@ class MainWindow(qt.QMainWindow):
         self._batch_worker_error = None
         self.integrate_button.setEnabled(False)
         self.save_current_action.setEnabled(False)
+        self.save_batch_plots_action.setEnabled(False)
         self.save_batch_video_action.setEnabled(False)
         self.save_data_action.setEnabled(False)
         self.save_ascii_video_action.setEnabled(False)
@@ -3946,6 +4030,7 @@ class MainWindow(qt.QMainWindow):
             return
         self.integrate_button.setEnabled(True)
         self.save_current_action.setEnabled(True)
+        self.save_batch_plots_action.setEnabled(True)
         self.save_batch_video_action.setEnabled(True)
         self.save_data_action.setEnabled(True)
         self.save_ascii_video_action.setEnabled(True)
@@ -3959,6 +4044,7 @@ class MainWindow(qt.QMainWindow):
         self._combined_export_plot_path = None
         self.integrate_button.setEnabled(True)
         self.save_current_action.setEnabled(True)
+        self.save_batch_plots_action.setEnabled(True)
         self.save_batch_video_action.setEnabled(True)
         self.save_data_action.setEnabled(True)
         self.save_ascii_video_action.setEnabled(True)
@@ -4008,6 +4094,7 @@ class MainWindow(qt.QMainWindow):
         self._exporting_video = True
         self._auto_integrate_images = True
         self.save_current_action.setEnabled(False)
+        self.save_batch_plots_action.setEnabled(False)
         self.save_batch_video_action.setEnabled(False)
         self.save_data_action.setEnabled(False)
         self.save_ascii_video_action.setEnabled(False)
@@ -4080,12 +4167,37 @@ class MainWindow(qt.QMainWindow):
             else:
                 self._combined_export_video_dir = None
                 self._restore_plot_export_state()
+                if self._batch_plot_only:
+                    output_dir = self._batch_plot_output_dir
+                    total = self._batch_plot_total
+                    self._batch_plot_only = False
+                    self._batch_plot_output_dir = ""
+                    self._set_save_actions_enabled(True)
+                    self.integrate_button.setEnabled(True)
+                    self._update_navigation_buttons()
+                    self.status_label.setText(
+                        f"Saved {total} plot image(s) to {output_dir}"
+                    )
+                    self._append_export_progress(
+                        f"Batch plots complete: [{total}/{total}]"
+                    )
             return
         if self._plot_export_original_paths is None:
             self._plot_export_original_paths = list(self.image_paths)
             self._plot_export_original_index = self.image_index
             self._plot_export_original_auto = self._auto_integrate_images
         source, filename = self._combined_export_plot_queue.pop(0)
+        if self._batch_plot_only:
+            self._batch_plot_current += 1
+            original_sources = self._plot_export_original_paths or self.image_paths
+            source_progress = self._source_file_frame_progress(
+                original_sources, self._batch_plot_current - 1
+            )
+            self.status_label.setText(
+                f"Saving [{self._batch_plot_current}/{self._batch_plot_total}]; "
+                f"{source_progress}"
+            )
+            self._update_scrolling_filename(source, "plot")
         self._exporting_plot = True
         self.image_paths = [source]
         self.image_index = 0
@@ -4102,6 +4214,53 @@ class MainWindow(qt.QMainWindow):
         self._plot_export_original_paths = None
         self._plot_export_current_filename = ""
         self._load_current_image()
+
+    @qt.Slot()
+    def save_batch_plots(self):
+        """Save one PNG for every selected image/frame to one folder."""
+        if not self.image_paths:
+            self.show_error("No Images", "Load one or more images first.")
+            return
+        poni = self.poni_edit.text().strip()
+        if not poni or not os.path.isfile(poni):
+            self.show_error(
+                "PONI File Required",
+                "Load a valid PONI file before exporting batch plots.",
+            )
+            return
+        try:
+            self._integration_ranges()
+        except ValueError as exc:
+            self.show_error("Invalid Parameters", str(exc))
+            return
+        output_dir = qt.QFileDialog.getExistingDirectory(
+            self, "Select Folder for Batch Plots", self.export_path
+        )
+        if not output_dir:
+            return
+        self._set_export_path(output_dir)
+        self._combined_export_video_dir = None
+        self._combined_export_video_groups = []
+        self._combined_export_plot_queue = []
+        for source in self.image_paths:
+            if source.frame is None:
+                plot_name = f"{Path(source.path).stem}_integrated.png"
+            else:
+                plot_name = (
+                    f"{Path(source.path).stem}_frame_"
+                    f"{source.frame + 1:04d}_integrated.png"
+                )
+            self._combined_export_plot_queue.append(
+                (source, str(Path(output_dir) / plot_name))
+            )
+        self._batch_plot_only = True
+        self._batch_plot_output_dir = output_dir
+        self._batch_plot_total = len(self._combined_export_plot_queue)
+        self._batch_plot_current = 0
+        self._reset_export_progress()
+        self._set_save_actions_enabled(False)
+        self.integrate_button.setEnabled(False)
+        self._start_next_combined_plot()
 
     @qt.Slot()
     def save_data_and_plots(self):
@@ -4248,6 +4407,7 @@ class MainWindow(qt.QMainWindow):
             self._batch_video_original_paths = None
             self._batch_video_queue.clear()
         self.save_current_action.setEnabled(True)
+        self.save_batch_plots_action.setEnabled(True)
         self.save_batch_video_action.setEnabled(True)
         self.save_data_action.setEnabled(True)
         self.save_ascii_video_action.setEnabled(True)
@@ -4335,7 +4495,10 @@ class MainWindow(qt.QMainWindow):
         filename = self._plot_export_current_filename
         if not self._save_current_plot_image(filename):
             self._exporting_plot = False
+            self._batch_plot_only = False
             self._restore_plot_export_state()
+            self._set_save_actions_enabled(True)
+            self.integrate_button.setEnabled(True)
             self.show_error("Save Failed", f"Could not save {filename}")
             return
         self._append_export_progress(

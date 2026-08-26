@@ -136,6 +136,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.curves = list()
         self.curve_headers = list()
         self.curve_units = list()
+        self.curve_has_error = list()
         self.factors = dict()
         self.lastcolorindex = -1
         self.Z = param['default_element']
@@ -493,11 +494,12 @@ class MainWindow(QtWidgets.QMainWindow):
                         pass
                 
                 try:
-                    source_header, q_unit = self._read_curve_header(item)
+                    source_header, q_unit, has_error = self._read_curve_header(item)
                     data = np.loadtxt(item,delimiter=param['import_ascii_delimiter'],comments=param['import_ascii_comments'])
                     self.curves.append(np.array(data))
                     self.curve_headers.append(source_header)
                     self.curve_units.append(q_unit)
+                    self.curve_has_error.append(has_error and data.shape[1] >= 3)
                 except:
                     continue
                 
@@ -553,7 +555,13 @@ class MainWindow(QtWidgets.QMainWindow):
         source_header = '\t'.join(tokens[:2]) if len(tokens) >= 2 else 'q_nm^-1\tIntensity'
         first_column = tokens[0].lower() if tokens else 'q_nm^-1'
         q_unit = 'A' if first_column.startswith('q_a^-1') else 'nm'
-        return source_header, q_unit
+        third_column = tokens[2].casefold() if len(tokens) >= 3 else ''
+        error_names = {
+            'sigma', 'error', 'errors', 'uncertainty', 'uncertainties',
+            'std', 'stdev', 'stddev', 'standard_deviation',
+        }
+        has_error = third_column in error_names
+        return source_header, q_unit, has_error
 
     def updatePlotWidget1(self):
         ''' this will update the plot widget of the input curves'''
@@ -652,6 +660,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.curves.pop(index.row())
         self.curve_headers.pop(index.row())
         self.curve_units.pop(index.row())
+        self.curve_has_error.pop(index.row())
         self.tableModel.removeDataset(index)
         self.updatePlotWidget1()
         if self.tableModel.rowCount() == 0:
@@ -673,6 +682,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.curve_headers.insert(target_row, header)
         unit = self.curve_units.pop(source_row)
         self.curve_units.insert(target_row, unit)
+        has_error = self.curve_has_error.pop(source_row)
+        self.curve_has_error.insert(target_row, has_error)
         self.updatePlotWidget1()
         if 'nrj_all' in self.factors:
             self.getAnomalousFactors()
@@ -874,20 +885,15 @@ class MainWindow(QtWidgets.QMainWindow):
         curves = list()
         for item in index_use:
             curves.append(self.curves[item])
-        curves = np.array(curves)
+        # Keep curves as a list: two-column and Sigma-bearing three-column
+        # files may be selected together and can have different shapes.
+        use_errors = all(self.curve_has_error[item] for item in index_use)
         q1 = curves[0][:,0]
         q2 = curves[1][:,0]
         q3 = curves[2][:,0]
         i1 = curves[0][:,1]
         i2 = curves[1][:,1]
         i3 = curves[2][:,1]
-        e1 = curves[0][:,2]
-        e2 = curves[1][:,2]
-        e3 = curves[2][:,2]
-
-
-        
-
         #print(f0)
         #print(f1)
         #print(f2)
@@ -948,7 +954,18 @@ class MainWindow(QtWidgets.QMainWindow):
             y= I_E[i,:]
 
             #x = np.linalg.solve(matA,y)
-            res = np.linalg.lstsq(matA,y)
+            if use_errors:
+                sigma = np.asarray([curve[i, 2] for curve in curves])
+                valid_sigma = np.all(np.isfinite(sigma)) and np.all(sigma > 0)
+            else:
+                valid_sigma = False
+            if valid_sigma:
+                weights = 1.0 / sigma
+                res = np.linalg.lstsq(
+                    matA * weights[:, np.newaxis], y * weights, rcond=None
+                )
+            else:
+                res = np.linalg.lstsq(matA, y, rcond=None)
             x = res[0]
             #print(x)
             I0[i] = x[0]
