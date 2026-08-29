@@ -71,6 +71,8 @@ import fabio
 import h5py
 import numpy as np
 import pyFAI
+from pyFAI.ext.invert_geometry import InvertGeometry
+from pyFAI.gui.utils import unitutils
 from silx.gui import qt
 from silx.gui.colors import Colormap
 from silx.gui.hdf5 import Hdf5TreeModel, Hdf5TreeView
@@ -123,7 +125,10 @@ MAX_DISPLAY_DIMENSION = 1200
 # which allocates detector-sized float64 temporary arrays.
 INTEGRATION_METHOD_1D = "histogram"
 INTEGRATION_METHOD_1D_ERROR = ("no", "histogram", "cython")
-INTEGRATION_METHOD_2D = ("no", "histogram", "cython")
+# Match pyFAI-calib2's Cake regrouping defaults: full pixel splitting with
+# histogram/Cython backends, 400 radial bins and 360 azimuthal sectors.
+INTEGRATION_METHOD_2D = ("full", "histogram", "cython")
+CAKE_RADIAL_POINTS = 400
 
 
 def wavelength_from_energy(energy_ev):
@@ -168,6 +173,68 @@ def read_ascii_columns(filename):
         if len(fields) == column_count:
             names = fields
     return np.asarray(rows, dtype=np.float64), names
+
+
+def read_ascii_datasets(filename):
+    """Return each SpecFile scan separately, or one regular ASCII table."""
+    lines = Path(filename).read_text(
+        encoding="utf-8-sig", errors="replace"
+    ).splitlines()
+    scan_starts = [
+        index for index, line in enumerate(lines)
+        if re.match(r"^\s*#S\s+\d+", line)
+    ]
+    if len(scan_starts) <= 1:
+        data, names = read_ascii_columns(filename)
+        return [(data, names, "")]
+
+    datasets = []
+    boundaries = scan_starts + [len(lines)]
+    for scan_index, (start, stop) in enumerate(
+        zip(boundaries[:-1], boundaries[1:]), start=1
+    ):
+        match = re.match(r"^\s*#S\s+(\d+)\s*(.*)", lines[start])
+        scan_number = match.group(1) if match else str(scan_index)
+        scan_title = match.group(2).strip() if match else ""
+        rows = []
+        names = None
+        column_count = None
+        for line in lines[start + 1:stop]:
+            text = line.strip()
+            if text.startswith("#L"):
+                header = text[2:].strip()
+                names = [
+                    item for item in re.split(r"\s{2,}|\t+", header)
+                    if item
+                ]
+                continue
+            if not text or text.startswith(("#", ";", "%")):
+                continue
+            fields = [item for item in re.split(r"[\s,]+", text) if item]
+            try:
+                values = [float(item) for item in fields]
+            except ValueError:
+                continue
+            if len(values) < 2:
+                continue
+            if column_count is None:
+                column_count = len(values)
+            if len(values) != column_count:
+                raise ValueError(
+                    f"SpecFile scan {scan_number} contains inconsistent columns."
+                )
+            rows.append(values)
+        if not rows:
+            continue
+        if names is not None and len(names) != column_count:
+            names = None
+        label = f"scan {scan_number}"
+        if scan_title:
+            label += f": {scan_title}"
+        datasets.append((np.asarray(rows, dtype=np.float64), names, label))
+    if not datasets:
+        raise ValueError("No numeric SpecFile scans were found.")
+    return datasets
 
 
 @contextmanager
@@ -421,6 +488,37 @@ def detector_mask_for_image(detector, image):
     return np.logical_or(np.asarray(static_mask, dtype=bool), dummy_mask)
 
 
+def azimuth_selection_mask(integrator, image_shape, ranges):
+    """Mask pixels outside the union of selected azimuthal ranges."""
+    if not ranges:
+        return None
+    azimuth = integrator.center_array(
+        tuple(image_shape[:2]), unit="chi_deg", scale=True
+    )
+    selected = np.zeros(azimuth.shape, dtype=bool)
+    for lower, upper in ranges:
+        selected |= (azimuth >= lower) & (azimuth <= upper)
+    return np.logical_not(selected)
+
+
+def combine_masks(*masks):
+    """Combine optional boolean masks without modifying any source mask."""
+    available = [np.asarray(mask, dtype=bool) for mask in masks if mask is not None]
+    if not available:
+        return None
+    combined = available[0]
+    for mask in available[1:]:
+        combined = np.logical_or(combined, mask)
+    return combined
+
+
+def azimuth_range_bounds(ranges):
+    """Return the outer pyFAI range while a mask preserves gaps between ranges."""
+    if not ranges:
+        return None
+    return (min(item[0] for item in ranges), max(item[1] for item in ranges))
+
+
 def mask_checksum(mask):
     """Return a stable checksum without materializing a bytes copy."""
     if mask is None:
@@ -465,7 +563,7 @@ class IntegrationWorker(qt.QObject):
     def __init__(
         self, image, integrator, mask, points, unit, radial_range,
         azimuth_range, error_model, references, calculate_cake, cached_cake,
-        cake_cache_key,
+        cake_cache_key, reuse_payload=None,
     ):
         super().__init__()
         self.image = image
@@ -480,6 +578,7 @@ class IntegrationWorker(qt.QObject):
         self.calculate_cake = calculate_cake
         self.cached_cake = cached_cake
         self.cake_cache_key = cake_cache_key
+        self.reuse_payload = reuse_payload
         self._cancel_requested = threading.Event()
 
     def cancel(self):
@@ -493,13 +592,39 @@ class IntegrationWorker(qt.QObject):
     def run(self):
         try:
             self._check_cancelled()
+            azimuth_mask = azimuth_selection_mask(
+                self.integrator, self.image.shape, self.azimuth_range
+            )
+            integration_mask = combine_masks(self.mask, azimuth_mask)
+            azimuth_bounds = azimuth_range_bounds(self.azimuth_range)
+            # calib2 leaves the azimuth range unspecified for its normal Cake
+            # calculation; pyFAI then derives the valid range from geometry.
+            cake_azimuth_range = azimuth_bounds
+            if self.reuse_payload is not None:
+                payload = dict(self.reuse_payload)
+                payload["cake"] = None
+                payload["cake_cache_key"] = self.cake_cache_key
+                cake = self.integrator.integrate2d(
+                    self.image, CAKE_RADIAL_POINTS, 360, mask=integration_mask,
+                    unit=self.unit, radial_range=self.radial_range,
+                    azimuth_range=cake_azimuth_range, method=INTEGRATION_METHOD_2D,
+                    correctSolidAngle=True,
+                )
+                payload["cake"] = {
+                    "intensity": np.asarray(cake.intensity),
+                    "radial": np.asarray(cake.radial),
+                    "azimuthal": np.asarray(cake.azimuthal),
+                }
+                self._check_cancelled()
+                self.finished.emit(payload)
+                return
             result = self.integrator.integrate1d(
                 self.image,
                 self.points,
-                mask=self.mask,
+                mask=integration_mask,
                 unit=self.unit,
                 radial_range=self.radial_range,
-                azimuth_range=self.azimuth_range,
+                azimuth_range=azimuth_bounds,
                 method=(
                     INTEGRATION_METHOD_1D_ERROR
                     if self.error_model is not None else INTEGRATION_METHOD_1D
@@ -526,13 +651,13 @@ class IntegrationWorker(qt.QObject):
                 self._check_cancelled()
                 if cached is None:
                     ref_result = self.integrator.integrate1d(
-                        data, self.points, mask=self.mask, unit=self.unit,
+                        data, self.points, mask=integration_mask, unit=self.unit,
                         radial_range=self.radial_range,
                         method=(
                             INTEGRATION_METHOD_1D_ERROR
                             if self.error_model is not None else INTEGRATION_METHOD_1D
                         ),
-                        azimuth_range=self.azimuth_range,
+                        azimuth_range=azimuth_bounds,
                         correctSolidAngle=True,
                         error_model=self.error_model,
                     )
@@ -602,9 +727,9 @@ class IntegrationWorker(qt.QObject):
             if self.calculate_cake and payload["cake"] is None:
                 self._check_cancelled()
                 cake = self.integrator.integrate2d(
-                    self.image, self.points, 360, mask=self.mask, unit=self.unit,
+                    self.image, CAKE_RADIAL_POINTS, 360, mask=integration_mask, unit=self.unit,
                     radial_range=self.radial_range,
-                    azimuth_range=self.azimuth_range,
+                    azimuth_range=cake_azimuth_range,
                     method=INTEGRATION_METHOD_2D, correctSolidAngle=True,
                 )
                 payload["cake"] = {
@@ -781,6 +906,7 @@ class BatchIntegrationWorker(qt.QObject):
         try:
             integrator = pyFAI.load(self.poni)
             mask_cache = {}
+            azimuth_mask_cache = {}
             reference_cache = {}
             total = len(self.paths)
             for index, path in enumerate(self.paths, 1):
@@ -830,6 +956,13 @@ class BatchIntegrationWorker(qt.QObject):
                         mask_cache[shape_key] = mask
                 else:
                     mask = mask_cache[shape_key]
+                if shape_key not in azimuth_mask_cache:
+                    azimuth_mask_cache[shape_key] = azimuth_selection_mask(
+                        integrator, image.shape, self.azimuth_range
+                    )
+                mask = combine_masks(mask, azimuth_mask_cache[shape_key])
+                azimuth_bounds = azimuth_range_bounds(self.azimuth_range)
+                cake_azimuth_range = azimuth_bounds
                 mask_key = (shape_key, mask_checksum(mask))
                 result = integrator.integrate1d(
                     image, self.points, mask=mask, unit=self.unit,
@@ -838,7 +971,7 @@ class BatchIntegrationWorker(qt.QObject):
                         INTEGRATION_METHOD_1D_ERROR
                         if self.error_model is not None else INTEGRATION_METHOD_1D
                     ),
-                    azimuth_range=self.azimuth_range,
+                    azimuth_range=azimuth_bounds,
                     correctSolidAngle=True,
                     error_model=self.error_model,
                 )
@@ -899,7 +1032,7 @@ class BatchIntegrationWorker(qt.QObject):
                                 if self.error_model is not None
                                 else INTEGRATION_METHOD_1D
                             ),
-                            azimuth_range=self.azimuth_range,
+                            azimuth_range=azimuth_bounds,
                             correctSolidAngle=True,
                             error_model=self.error_model,
                         )
@@ -1233,6 +1366,161 @@ class XYSelectionDialog(qt.QDialog):
         )
 
 
+class FilterWindow(qt.QDialog):
+    """Non-modal filter controls which act only when Process is pressed."""
+
+    processRequested = qt.Signal(object, bool, bool, object)
+
+    def __init__(self, parent=None, title="1D Data Filter", plot=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(False)
+        self.setAttribute(qt.Qt.WA_DeleteOnClose)
+        layout = qt.QVBoxLayout(self)
+        form = qt.QFormLayout()
+        self.filter_mode = qt.QComboBox(self)
+        self.filter_mode.addItems((
+            "Absolute Threshold", "Neighbour Sigma",
+        ))
+        form.addRow("Filter method:", self.filter_mode)
+        self.threshold = qt.QDoubleSpinBox(self)
+        self.threshold.setDecimals(12)
+        self.threshold.setRange(0.0, 1.0e300)
+        self.threshold.setToolTip(
+            "Flag a point when its absolute difference from the mean of the "
+            "two points on each side is greater than this value."
+        )
+        form.addRow("Threshold:", self.threshold)
+        self.sigma_multiplier = qt.QDoubleSpinBox(self)
+        self.sigma_multiplier.setDecimals(6)
+        self.sigma_multiplier.setRange(0.0, 1.0e6)
+        self.sigma_multiplier.setValue(3.0)
+        self.sigma_multiplier.setEnabled(False)
+        self.sigma_multiplier.setToolTip(
+            "Flag a point when its difference from the four-neighbour mean "
+            "is greater than this multiple of their standard deviation."
+        )
+        form.addRow("Sigma multiplier:", self.sigma_multiplier)
+        self.filter_mode.currentIndexChanged.connect(
+            self._filter_mode_changed
+        )
+        self.use_x_range = qt.QCheckBox("Limit filtering to X range", self)
+        self.x_minimum = qt.QDoubleSpinBox(self)
+        self.x_maximum = qt.QDoubleSpinBox(self)
+        for editor in (self.x_minimum, self.x_maximum):
+            editor.setDecimals(12)
+            editor.setRange(-1.0e300, 1.0e300)
+            editor.setEnabled(False)
+        self.use_x_range.toggled.connect(self.x_minimum.setEnabled)
+        self.use_x_range.toggled.connect(self.x_maximum.setEnabled)
+        form.addRow(self.use_x_range)
+        form.addRow("X minimum:", self.x_minimum)
+        form.addRow("X maximum:", self.x_maximum)
+        self.select_range_button = qt.QPushButton(
+            "Select X Range on Plot", self
+        )
+        self.select_range_button.setEnabled(plot is not None)
+        self.select_range_button.setToolTip(
+            "Click, then drag a rectangle across the desired X range on the plot"
+        )
+        form.addRow(self.select_range_button)
+        layout.addLayout(form)
+        self._plot = plot
+        if plot is not None:
+            self.select_range_button.clicked.connect(self._start_range_selection)
+            plot.sigPlotSignal.connect(self._plot_event)
+        self.show_points = qt.QCheckBox(
+            "Show flagged points in another color", self
+        )
+        self.delete_points = qt.QCheckBox(
+            "Delete flagged points from the 1D plot", self
+        )
+        self.delete_points.setToolTip(
+            "Remove flagged points from the displayed curve."
+        )
+        self.show_points.toggled.connect(self._show_toggled)
+        self.delete_points.toggled.connect(self._delete_toggled)
+        layout.addWidget(self.show_points)
+        layout.addWidget(self.delete_points)
+        note = qt.QLabel(
+            "Only points with two neighbours on both sides are tested.\n"
+            "Process applies these settings to the data currently displayed.",
+            self,
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.result_label = qt.QLabel("", self)
+        layout.addWidget(self.result_label)
+        buttons = qt.QDialogButtonBox(qt.QDialogButtonBox.Close, parent=self)
+        process_button = buttons.addButton(
+            "Process", qt.QDialogButtonBox.ActionRole
+        )
+        process_button.clicked.connect(self._request_process)
+        buttons.rejected.connect(self.close)
+        layout.addWidget(buttons)
+
+    @qt.Slot()
+    def _request_process(self):
+        criterion = (
+            ("sigma", self.sigma_multiplier.value())
+            if self.filter_mode.currentIndex() == 1
+            else ("threshold", self.threshold.value())
+        )
+        self.processRequested.emit(
+            criterion,
+            self.show_points.isChecked(),
+            self.delete_points.isChecked(),
+            (
+                (self.x_minimum.value(), self.x_maximum.value())
+                if self.use_x_range.isChecked() else None
+            ),
+        )
+
+    @qt.Slot(int)
+    def _filter_mode_changed(self, index):
+        self.threshold.setEnabled(index == 0)
+        self.sigma_multiplier.setEnabled(index == 1)
+
+    @qt.Slot(bool)
+    def _show_toggled(self, checked):
+        if checked:
+            self.delete_points.setChecked(False)
+
+    @qt.Slot(bool)
+    def _delete_toggled(self, checked):
+        if checked:
+            self.show_points.setChecked(False)
+
+    def show_result(self, flagged_count, action):
+        self.result_label.setText(
+            f"{flagged_count:,} point(s) {action}."
+        )
+
+    @qt.Slot()
+    def _start_range_selection(self):
+        self._plot.setInteractiveMode(
+            "draw", shape="rectangle", color="#e53935",
+            label="filter-x-range", source=self,
+        )
+        self.select_range_button.setText("Drag on the plot...")
+
+    @qt.Slot(object)
+    def _plot_event(self, event):
+        if (
+            event.get("event") != "drawingFinished"
+            or event.get("type") != "rectangle"
+            or event.get("parameters", {}).get("label") != "filter-x-range"
+        ):
+            return
+        x_values = np.asarray(event.get("xdata", ()), dtype=np.float64)
+        if x_values.size:
+            self.x_minimum.setValue(float(np.min(x_values)))
+            self.x_maximum.setValue(float(np.max(x_values)))
+            self.use_x_range.setChecked(True)
+        self.select_range_button.setText("Select X Range on Plot")
+        self._plot.resetInteractiveMode()
+
+
 class ExternalCurveWindow(qt.QMainWindow):
     """Independent silx window used for Options > Plot commands."""
 
@@ -1304,6 +1592,9 @@ class MultiAsciiCurveWindow(qt.QMainWindow):
         self.plot.setDataMargins(0.05, 0.05, 0.05, 0.05)
         self._curve_data = {}
         self._curve_items = {}
+        self._curve_sources = {}
+        self._filter_window = None
+        self._input_path = str(Path(curves[0][3]).parent) if curves else ""
 
         # Expose silx's native logarithmic-axis actions in Plot1D's main
         # toolbar, exactly where the main integration window shows its plot
@@ -1320,6 +1611,34 @@ class MultiAsciiCurveWindow(qt.QMainWindow):
         self.log_y_action.setVisible(True)
         plot_toolbar.addAction(self.log_x_action)
         plot_toolbar.addAction(self.log_y_action)
+        self.filter_action = plot_toolbar.addAction("Filter...")
+        self.filter_action.setToolTip(
+            "Filter selected curves, or all currently visible curves"
+        )
+        self.filter_action.triggered.connect(self.open_filter_window)
+        self.save_filtered_action = plot_toolbar.addAction(
+            "Save Filtered Curves..."
+        )
+        self.save_filtered_action.setToolTip(
+            "Save each checked curve as a separate *_filtered.dat file"
+        )
+        self.save_filtered_action.triggered.connect(self.save_filtered_curves)
+        self.add_data_action = plot_toolbar.addAction("Add Data...")
+        self.add_data_action.setToolTip(
+            "Import more ASCII curves into this window"
+        )
+        self.add_data_action.triggered.connect(self.add_ascii_data)
+        self.subtract_action = plot_toolbar.addAction("Subtract Curves")
+        self.subtract_action.setToolTip(
+            "Choose which curve to subtract from and which curve to subtract"
+        )
+        self.subtract_action.triggered.connect(self.subtract_selected_curves)
+        options_menu = self.menuBar().addMenu("Options")
+        options_menu.addAction(self.add_data_action)
+        options_menu.addAction(self.subtract_action)
+        options_menu.addSeparator()
+        options_menu.addAction(self.filter_action)
+        options_menu.addAction(self.save_filtered_action)
         self.log_x_action.toggled.connect(self._axis_scale_changed)
         self.log_y_action.toggled.connect(self._axis_scale_changed)
 
@@ -1328,32 +1647,353 @@ class MultiAsciiCurveWindow(qt.QMainWindow):
         visibility_dock.setFeatures(
             qt.QDockWidget.DockWidgetMovable | qt.QDockWidget.DockWidgetFloatable
         )
-        curve_list = qt.QListWidget(visibility_dock)
+        visibility_widget = qt.QWidget(visibility_dock)
+        visibility_layout = qt.QVBoxLayout(visibility_widget)
+        visibility_layout.setContentsMargins(4, 4, 4, 4)
+        self.select_all_check = qt.QCheckBox("Select All", visibility_widget)
+        self.select_all_check.setChecked(True)
+        visibility_layout.addWidget(self.select_all_check)
+        curve_list = qt.QListWidget(visibility_widget)
+        curve_list.setSelectionMode(qt.QAbstractItemView.ExtendedSelection)
         curve_list.setAlternatingRowColors(True)
         curve_list.setIconSize(qt.QSize(48, 16))
-        visibility_dock.setWidget(curve_list)
+        curve_list.setDragEnabled(True)
+        curve_list.setAcceptDrops(True)
+        curve_list.setDropIndicatorShown(True)
+        curve_list.setDragDropMode(qt.QAbstractItemView.InternalMove)
+        curve_list.setDefaultDropAction(qt.Qt.MoveAction)
+        visibility_layout.addWidget(curve_list, 1)
+        visibility_dock.setWidget(visibility_widget)
         self.addDockWidget(qt.Qt.RightDockWidgetArea, visibility_dock)
         self.curve_list = curve_list
-
-        for legend, x_values, y_values in curves:
-            self._curve_data[legend] = (
-                np.asarray(x_values), np.asarray(y_values)
-            )
-            curve = self.plot.addCurve(
-                x_values, y_values, legend=legend, resetzoom=False
-            )
-            item = qt.QListWidgetItem(legend)
-            item.setIcon(self._curve_style_icon(curve))
-            item.setToolTip(
-                f"{legend}\nColor: {curve.getColor()}\n"
-                f"Line style: {curve.getLineStyle()}"
-            )
-            item.setFlags(item.flags() | qt.Qt.ItemIsUserCheckable)
-            item.setCheckState(qt.Qt.Checked)
-            curve_list.addItem(item)
-            self._curve_items[legend] = item
+        self.select_all_check.toggled.connect(self._toggle_all_curves)
         curve_list.itemChanged.connect(self._curve_visibility_changed)
+
+        for curve_info in curves:
+            self._add_curve(curve_info)
         self.plot.resetZoom()
+
+    def _unique_legend(self, requested):
+        if requested not in self._curve_data:
+            return requested
+        number = 2
+        while f"{requested} ({number})" in self._curve_data:
+            number += 1
+        return f"{requested} ({number})"
+
+    def _add_curve(self, curve_info):
+        legend, x_values, y_values = curve_info[:3]
+        source_path = curve_info[3] if len(curve_info) > 3 else legend
+        scan_label = curve_info[4] if len(curve_info) > 4 else ""
+        legend = self._unique_legend(str(legend))
+        x_values = np.asarray(x_values)
+        y_values = np.asarray(y_values)
+        self._curve_data[legend] = (x_values, y_values)
+        self._curve_sources[legend] = (str(source_path), scan_label)
+        curve = self.plot.addCurve(
+            x_values, y_values, legend=legend, resetzoom=False
+        )
+        item = qt.QListWidgetItem(legend)
+        item.setIcon(self._curve_style_icon(curve))
+        item.setToolTip(
+            f"{legend}\nColor: {curve.getColor()}\n"
+            f"Line style: {curve.getLineStyle()}"
+        )
+        item.setFlags(item.flags() | qt.Qt.ItemIsUserCheckable)
+        item.setCheckState(qt.Qt.Checked)
+        self.curve_list.addItem(item)
+        self._curve_items[legend] = item
+        return legend
+
+    @qt.Slot()
+    def add_ascii_data(self):
+        filenames, _ = qt.QFileDialog.getOpenFileNames(
+            self, "Select One or More ASCII Files", self._input_path,
+            "ASCII data (*.dat *.txt *.csv *.asc);;All files (*)",
+        )
+        if not filenames:
+            return
+        try:
+            tables = []
+            for filename in filenames:
+                for data, names, scan_label in read_ascii_datasets(filename):
+                    tables.append((filename, data, names, scan_label))
+            first_data, first_names = tables[0][1], tables[0][2]
+            choices = [
+                f"Column {index + 1}: {first_names[index]}" if first_names
+                else f"Column {index + 1}"
+                for index in range(first_data.shape[1])
+            ]
+            dialog = XYSelectionDialog(
+                "Select X and Y Columns for Added ASCII Files", choices, self
+            )
+            if dialog.exec() != qt.QDialog.Accepted:
+                return
+            x_index, y_index, _x_label, _y_label = dialog.selection()
+            for filename, data, _names, scan_label in tables:
+                if max(x_index, y_index) >= data.shape[1]:
+                    raise ValueError(
+                        f"{Path(filename).name} has only {data.shape[1]} columns; "
+                        "the selected columns are unavailable."
+                    )
+                legend = Path(filename).name
+                if scan_label:
+                    legend = f"{legend} [{scan_label}]"
+                self._add_curve((
+                    legend, data[:, x_index], data[:, y_index],
+                    filename, scan_label,
+                ))
+            self._input_path = str(Path(filenames[0]).parent)
+            self.plot.resetZoom()
+        except Exception as error:
+            qt.QMessageBox.critical(self, "Cannot Add ASCII Data", str(error))
+
+    @qt.Slot()
+    def subtract_selected_curves(self):
+        if self.curve_list.count() < 2:
+            qt.QMessageBox.information(
+                self, "Two Curves Required",
+                "Add at least two curves before subtracting.",
+            )
+            return
+        legends = [
+            self.curve_list.item(row).text()
+            for row in range(self.curve_list.count())
+        ]
+        selected = self.curve_list.selectedItems()
+        dialog = qt.QDialog(self)
+        dialog.setWindowTitle("Subtract Curves")
+        layout = qt.QFormLayout(dialog)
+        minuend_combo = qt.QComboBox(dialog)
+        subtrahend_combo = qt.QComboBox(dialog)
+        minuend_combo.addItems(legends)
+        subtrahend_combo.addItems(legends)
+        if len(selected) == 2:
+            selected_rows = sorted(self.curve_list.row(item) for item in selected)
+            minuend_combo.setCurrentIndex(selected_rows[0])
+            subtrahend_combo.setCurrentIndex(selected_rows[1])
+        else:
+            subtrahend_combo.setCurrentIndex(1)
+        layout.addRow("Curve to subtract from", minuend_combo)
+        layout.addRow("Curve to subtract", subtrahend_combo)
+        preview = qt.QLabel(dialog)
+        layout.addRow("Calculation", preview)
+
+        def update_preview(*_args):
+            preview.setText(
+                f"{minuend_combo.currentText()} − "
+                f"{subtrahend_combo.currentText()}"
+            )
+
+        minuend_combo.currentIndexChanged.connect(update_preview)
+        subtrahend_combo.currentIndexChanged.connect(update_preview)
+        update_preview()
+        buttons = qt.QDialogButtonBox(
+            qt.QDialogButtonBox.Ok | qt.QDialogButtonBox.Cancel, dialog
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+        if dialog.exec() != qt.QDialog.Accepted:
+            return
+        first_legend = minuend_combo.currentText()
+        second_legend = subtrahend_combo.currentText()
+        if first_legend == second_legend:
+            qt.QMessageBox.warning(
+                self, "Select Different Curves",
+                "The curve to subtract from and the curve to subtract must differ.",
+            )
+            return
+        first_curve = self.plot.getCurve(first_legend)
+        second_curve = self.plot.getCurve(second_legend)
+        first_x = first_curve.getXData(copy=False)
+        first_y = first_curve.getYData(copy=False)
+        second_x = second_curve.getXData(copy=False)
+        second_y = second_curve.getYData(copy=False)
+        first_x = np.asarray(first_x, dtype=np.float64)
+        first_y = np.asarray(first_y, dtype=np.float64)
+        second_x = np.asarray(second_x, dtype=np.float64)
+        second_y = np.asarray(second_y, dtype=np.float64)
+        if first_x.size == 0 or second_x.size == 0:
+            qt.QMessageBox.critical(self, "Cannot Subtract", "A selected curve is empty.")
+            return
+        if np.array_equal(first_x, second_x):
+            result_x = first_x
+            result_y = first_y - second_y
+        else:
+            finite_second = np.isfinite(second_x) & np.isfinite(second_y)
+            second_x = second_x[finite_second]
+            second_y = second_y[finite_second]
+            if second_x.size == 0:
+                qt.QMessageBox.critical(
+                    self, "Cannot Subtract",
+                    "The second selected curve has no finite data points.",
+                )
+                return
+            order = np.argsort(second_x)
+            sorted_x = second_x[order]
+            sorted_y = second_y[order]
+            unique_x, unique_indices = np.unique(sorted_x, return_index=True)
+            sorted_y = sorted_y[unique_indices]
+            overlap = (
+                np.isfinite(first_x) & np.isfinite(first_y)
+                & (first_x >= unique_x[0]) & (first_x <= unique_x[-1])
+            )
+            if unique_x.size < 2 or not np.any(overlap):
+                qt.QMessageBox.critical(
+                    self, "Cannot Subtract",
+                    "The selected curves do not have a usable common X range.",
+                )
+                return
+            result_x = first_x[overlap]
+            result_y = first_y[overlap] - np.interp(
+                result_x, unique_x, sorted_y
+            )
+        legend = f"{first_legend} - {second_legend}"
+        added_legend = self._add_curve((legend, result_x, result_y, legend, ""))
+        self.curve_list.clearSelection()
+        self._curve_items[added_legend].setSelected(True)
+        self.plot.resetZoom()
+        self.statusBar().showMessage(f"Created {added_legend}", 8000)
+
+    @qt.Slot()
+    def save_filtered_curves(self):
+        legends = [
+            self.curve_list.item(index).text()
+            for index in range(self.curve_list.count())
+            if self.curve_list.item(index).checkState() == qt.Qt.Checked
+        ]
+        if not legends:
+            qt.QMessageBox.information(
+                self, "No Curves", "Select at least one curve to save."
+            )
+            return
+        first_source = Path(self._curve_sources[legends[0]][0])
+        initial_directory = (
+            str(first_source.parent) if first_source.parent.is_dir()
+            else str(Path.home())
+        )
+        output_directory = qt.QFileDialog.getExistingDirectory(
+            self, "Select Folder for Filtered Curves", initial_directory
+        )
+        if not output_directory:
+            return
+        name_counts = {}
+        saved = 0
+        for legend in legends:
+            curve = self.plot.getCurve(legend)
+            if curve is None:
+                continue
+            source_path, _scan_label = self._curve_sources[legend]
+            stem = Path(source_path).stem
+            name_counts[stem] = name_counts.get(stem, 0) + 1
+            duplicate_index = name_counts[stem]
+            duplicate_count = sum(
+                Path(self._curve_sources[name][0]).stem == stem
+                for name in legends
+            )
+            suffix = (
+                f"_scan_{duplicate_index}" if duplicate_count > 1 else ""
+            )
+            output_path = Path(output_directory) / (
+                f"{stem}{suffix}_filtered.dat"
+            )
+            x_values = np.asarray(curve.getXData(copy=False))
+            y_values = np.asarray(curve.getYData(copy=False))
+            try:
+                np.savetxt(
+                    output_path,
+                    np.column_stack((x_values, y_values)),
+                    fmt="%.18e",
+                    header=(
+                        f"{self.plot.getXAxis().getLabel()} "
+                        f"{self.plot.getYAxis().getLabel()}"
+                    ),
+                )
+            except OSError as error:
+                qt.QMessageBox.critical(
+                    self, "Save Failed", f"Could not save {output_path}:\n{error}"
+                )
+                return
+            saved += 1
+        self.statusBar().showMessage(
+            f"Saved {saved} filtered curve(s) to {output_directory}", 8000
+        )
+
+    @qt.Slot(bool)
+    def _toggle_all_curves(self, checked):
+        for index in range(self.curve_list.count()):
+            item = self.curve_list.item(index)
+            item.setCheckState(qt.Qt.Checked if checked else qt.Qt.Unchecked)
+
+    @qt.Slot()
+    def open_filter_window(self):
+        if self._filter_window is not None:
+            self._filter_window.raise_()
+            self._filter_window.activateWindow()
+            return
+        window = FilterWindow(self, "Filter ASCII Curves", self.plot)
+        window.processRequested.connect(self._process_filter)
+        window.destroyed.connect(self._filter_window_destroyed)
+        self._filter_window = window
+        window.show()
+
+    @qt.Slot()
+    def _filter_window_destroyed(self, _object=None):
+        self._filter_window = None
+
+    @qt.Slot(object, bool, bool, object)
+    def _process_filter(
+        self, criterion, show_points, delete_points, x_range
+    ):
+        selected = self.curve_list.selectedItems()
+        if selected:
+            legends = [item.text() for item in selected]
+        else:
+            legends = [
+                self.curve_list.item(index).text()
+                for index in range(self.curve_list.count())
+                if self.curve_list.item(index).checkState() == qt.Qt.Checked
+            ]
+        if not legends:
+            qt.QMessageBox.information(
+                self, "No Curves", "Select a curve or make a curve visible first."
+            )
+            return
+        total_flagged = 0
+        for legend in legends:
+            marker_legend = f"Filtered points: {legend}"
+            self.plot.removeCurve(marker_legend)
+            x_values, y_values = self._curve_data[legend]
+            outliers = MainWindow._filter_outlier_mask(y_values, criterion)
+            if x_range is not None:
+                x_minimum, x_maximum = sorted(x_range)
+                outliers &= (
+                    np.asarray(x_values) >= x_minimum
+                ) & (np.asarray(x_values) <= x_maximum)
+            total_flagged += int(np.count_nonzero(outliers))
+            keep = ~outliers if delete_points else slice(None)
+            old_curve = self.plot.getCurve(legend)
+            color = old_curve.getColor() if old_curve is not None else None
+            visible = self._curve_items[legend].checkState() == qt.Qt.Checked
+            curve = self.plot.addCurve(
+                x_values[keep], y_values[keep], legend=legend, color=color,
+                resetzoom=False,
+            )
+            curve.setVisible(visible)
+            if show_points and not delete_points and np.any(outliers):
+                marker = self.plot.addCurve(
+                    x_values[outliers], y_values[outliers],
+                    legend=marker_legend, color="#e53935", linestyle="",
+                    symbol="o", resetzoom=False,
+                )
+                marker.setVisible(visible)
+        self.plot.replot()
+        action = "deleted" if delete_points else (
+            "marked" if show_points else "found"
+        )
+        if self._filter_window is not None:
+            self._filter_window.show_result(total_flagged, action)
 
     @staticmethod
     def _curve_style_icon(curve):
@@ -1404,8 +2044,19 @@ class MultiAsciiCurveWindow(qt.QMainWindow):
     def _curve_visibility_changed(self, item):
         curve = self.plot.getCurve(item.text())
         if curve is not None:
-            curve.setVisible(item.checkState() == qt.Qt.Checked)
+            visible = item.checkState() == qt.Qt.Checked
+            curve.setVisible(visible)
+            marker = self.plot.getCurve(f"Filtered points: {item.text()}")
+            if marker is not None:
+                marker.setVisible(visible)
             self.plot.replot()
+        all_checked = self.curve_list.count() > 0 and all(
+            self.curve_list.item(index).checkState() == qt.Qt.Checked
+            for index in range(self.curve_list.count())
+        )
+        self.select_all_check.blockSignals(True)
+        self.select_all_check.setChecked(all_checked)
+        self.select_all_check.blockSignals(False)
 
 
 class StatusPanelProxy:
@@ -1450,9 +2101,15 @@ class MainWindow(qt.QMainWindow):
         self._beamline = None
         self._measurement_mode = None
         self.mask_data: np.ndarray | None = None
+        self._cake_markers = []
+        self._cake_inverse_geometry = None
+        self._cake_inverse_geometry_key = None
         self.empty_data: np.ndarray | None = None
         self.background_data: np.ndarray | None = None
         self._reference_sources = {"empty": [], "background": []}
+        self._cake_requested = False
+        self._last_1d_context = None
+        self._pending_1d_context = None
         self.detector_mask: np.ndarray | None = None
         self._effective_mask_cache = None
         self._effective_mask_crc = None
@@ -1499,6 +2156,7 @@ class MainWindow(qt.QMainWindow):
         self._batch_worker = None
         self._batch_worker_result = None
         self._batch_worker_error = None
+        self._batch_export_sources = []
         self._combined_export_video_dir = None
         self._combined_export_plot_path = None
         self._combined_export_plot_queue = []
@@ -1522,6 +2180,9 @@ class MainWindow(qt.QMainWindow):
         self._external_plot_windows = []
         self._asaxs_windows = []
         self._asaxs_module = None
+        self._filter_window = None
+        self._filtered_payload = None
+        self._current_filter = (("threshold", 0.0), False, False, None)
         self._build_ui()
         self._build_menu_bar()
 
@@ -1539,11 +2200,17 @@ class MainWindow(qt.QMainWindow):
         self.p62_action.toggled.connect(self._set_p62_enabled)
         file_menu.addSeparator()
         save_menu = file_menu.addMenu("Save")
-        self.save_current_action = save_menu.addAction("Plot (current view)")
-        self.save_batch_plots_action = save_menu.addAction("Batch Plots")
-        self.save_batch_video_action = save_menu.addAction("Batch Video")
-        self.save_data_action = save_menu.addAction("ASCII (all integrated data)")
+        data_menu = save_menu.addMenu("Data")
+        plots_menu = save_menu.addMenu("Plots")
+        self.save_current_data_action = data_menu.addAction("ASCII (current)")
+        self.save_data_action = data_menu.addAction("ASCII (all)")
+        self.save_current_action = plots_menu.addAction("Plot (current view)")
+        self.save_batch_plots_action = plots_menu.addAction("Batch Plots")
+        self.save_batch_video_action = plots_menu.addAction("Batch Video")
         self.save_ascii_video_action = save_menu.addAction("Data and Plots")
+        self.save_current_data_action.triggered.connect(
+            self.save_current_integrated_data
+        )
         self.save_current_action.triggered.connect(self.save_current_view)
         self.save_batch_plots_action.triggered.connect(self.save_batch_plots)
         self.save_batch_video_action.triggered.connect(self.save_batch_videos)
@@ -1552,13 +2219,102 @@ class MainWindow(qt.QMainWindow):
         options_menu = menu_bar.addMenu("Options")
         self.plot_nexus_action = options_menu.addAction("Plot NeXus...")
         self.plot_ascii_action = options_menu.addAction("Plot ASCII...")
-        self.asaxs_action = options_menu.addAction("ASAXS...")
+        self.filter_action = options_menu.addAction("Filter...")
+        self.asaxs_menu = options_menu.addMenu("ASAXS")
+        self.stuhrmann_action = self.asaxs_menu.addAction("Stuhrmann")
+        self.global_model_action = self.asaxs_menu.addAction("Global model fit")
         self.plot_nexus_action.triggered.connect(self.plot_nexus_data)
         self.plot_ascii_action.triggered.connect(self.plot_ascii_data)
-        self.asaxs_action.triggered.connect(self.open_asaxs_window)
+        self.filter_action.triggered.connect(self.open_filter_dialog)
+        self.stuhrmann_action.triggered.connect(lambda: self.open_asaxs_window("stuhrmann"))
+        self.global_model_action.triggered.connect(lambda: self.open_asaxs_window("global"))
         # Keep the view selector in the menu-bar row so it does not push the
         # integration toolbar below the Source image toolbar.
         menu_bar.setCornerWidget(self.right_tab_bar, qt.Qt.TopRightCorner)
+
+    @staticmethod
+    def _filter_outlier_mask(intensity, criterion):
+        """Flag points differing from their two neighbours on either side."""
+        values = np.asarray(intensity, dtype=np.float64)
+        flagged = np.zeros(values.shape, dtype=bool)
+        if values.ndim != 1 or values.size < 5:
+            return flagged
+        neighbours = np.stack((
+            values[:-4], values[1:-3], values[3:-1], values[4:]
+        ))
+        neighbour_mean = np.mean(neighbours, axis=0)
+        centres = values[2:-2]
+        difference = np.abs(centres - neighbour_mean)
+        mode, value = criterion
+        limit = (
+            float(value) * np.std(neighbours, axis=0, ddof=0)
+            if mode == "sigma" else float(value)
+        )
+        valid = np.isfinite(centres) & np.isfinite(neighbours).all(axis=0)
+        flagged[2:-2] = valid & (difference > limit)
+        return flagged
+
+    @qt.Slot()
+    def open_filter_dialog(self):
+        """Open non-modal controls; Process acts on the current payload only."""
+        if self._filter_window is not None:
+            self._filter_window.raise_()
+            self._filter_window.activateWindow()
+            return
+        window = FilterWindow(self, plot=self.result_plot)
+        criterion, show_points, delete_points, x_range = self._current_filter
+        mode, value = criterion
+        if mode == "sigma":
+            window.filter_mode.setCurrentIndex(1)
+            window.sigma_multiplier.setValue(value)
+        else:
+            window.filter_mode.setCurrentIndex(0)
+            window.threshold.setValue(value)
+        window.show_points.setChecked(show_points)
+        window.delete_points.setChecked(delete_points)
+        if x_range is not None:
+            window.x_minimum.setValue(x_range[0])
+            window.x_maximum.setValue(x_range[1])
+            window.use_x_range.setChecked(True)
+        window.processRequested.connect(self._process_current_filter)
+        window.destroyed.connect(self._main_filter_window_destroyed)
+        self._filter_window = window
+        window.show()
+
+    @qt.Slot()
+    def _main_filter_window_destroyed(self, _object=None):
+        self._filter_window = None
+
+    @qt.Slot(object, bool, bool, object)
+    def _process_current_filter(
+        self, criterion, show_points, delete_points, x_range
+    ):
+        if self._last_integration_payload is None:
+            qt.QMessageBox.information(
+                self, "No 1D Data", "Integrate the current image first."
+            )
+            return
+        self._current_filter = (
+            criterion, show_points, delete_points, x_range
+        )
+        self._filtered_payload = self._last_integration_payload
+        self._render_integration_payload(
+            self._last_integration_payload, preserve_view=True
+        )
+        outliers = self._filter_outlier_mask(
+            self._last_integration_payload["sample"], criterion
+        )
+        if x_range is not None:
+            x_minimum, x_maximum = sorted(x_range)
+            radial = np.asarray(self._last_integration_payload["radial"])
+            outliers &= (radial >= x_minimum) & (radial <= x_maximum)
+        action = "deleted" if delete_points else (
+            "marked" if show_points else "found"
+        )
+        if self._filter_window is not None:
+            self._filter_window.show_result(
+                int(np.count_nonzero(outliers)), action
+            )
 
     def _show_external_curve(self, x, y, x_label, y_label, filename):
         if x.shape != y.shape:
@@ -1566,7 +2322,7 @@ class MainWindow(qt.QMainWindow):
                 f"X and Y lengths differ ({x.size} and {y.size})."
             )
         window = ExternalCurveWindow(
-            x, y, x_label, y_label, Path(filename).name, self,
+            x, y, x_label, y_label, Path(filename).name, None,
         )
         self._external_plot_windows.append(window)
         window.destroyed.connect(
@@ -1579,7 +2335,7 @@ class MainWindow(qt.QMainWindow):
             self._external_plot_windows.remove(window)
 
     @qt.Slot()
-    def open_asaxs_window(self):
+    def open_asaxs_window(self, mode="stuhrmann"):
         """Open the PyAnomScat Stuhrmann GUI as a child application window."""
         try:
             if not PYANOMSCAT_SCRIPT.is_file():
@@ -1598,10 +2354,11 @@ class MainWindow(qt.QMainWindow):
             previous_directory = os.getcwd()
             try:
                 os.chdir(PYANOMSCAT_SCRIPT.parent)
-                window = self._asaxs_module.MainWindow(parent=self)
+                window = self._asaxs_module.MainWindow(parent=None)
             finally:
                 os.chdir(previous_directory)
             window.appImportPath = self.input_path
+            window.asaxs_mode = mode
             if hasattr(window, "statusbar"):
                 window.statusbar.showMessage(window.appImportPath)
             window.setAttribute(qt.Qt.WA_DeleteOnClose)
@@ -1610,6 +2367,8 @@ class MainWindow(qt.QMainWindow):
                 lambda _=None, window=window: self._remove_asaxs_window(window)
             )
             window.show()
+            if mode == "global" and hasattr(window, "runGlobalModelVersion"):
+                QtCore.QTimer.singleShot(0, window.runGlobalModelVersion)
         except Exception as error:
             self.show_error("Cannot Open ASAXS", traceback.format_exc())
 
@@ -1618,7 +2377,7 @@ class MainWindow(qt.QMainWindow):
             self._asaxs_windows.remove(window)
 
     def _show_external_curves(self, curves, x_label, y_label):
-        window = MultiAsciiCurveWindow(curves, x_label, y_label, self)
+        window = MultiAsciiCurveWindow(curves, x_label, y_label, None)
         self._external_plot_windows.append(window)
         window.destroyed.connect(
             lambda _=None, window=window: self._remove_external_plot(window)
@@ -1661,8 +2420,9 @@ class MainWindow(qt.QMainWindow):
         try:
             tables = []
             for filename in filenames:
-                data, names = read_ascii_columns(filename)
-                tables.append((filename, data, names))
+                datasets = read_ascii_datasets(filename)
+                for data, names, scan_label in datasets:
+                    tables.append((filename, data, names, scan_label))
             first_data, first_names = tables[0][1], tables[0][2]
             choices = [
                 f"Column {index + 1}: {first_names[index]}" if first_names
@@ -1677,17 +2437,22 @@ class MainWindow(qt.QMainWindow):
             x_index, y_index, x_label, y_label = dialog.selection()
             curves = []
             used_legends = {}
-            for filename, data, _names in tables:
+            for filename, data, _names, scan_label in tables:
                 if max(x_index, y_index) >= data.shape[1]:
                     raise ValueError(
                         f"{Path(filename).name} has only {data.shape[1]} columns; "
                         f"the selected columns are unavailable."
                     )
                 base_legend = Path(filename).name
+                if scan_label:
+                    base_legend = f"{base_legend} [{scan_label}]"
                 used_legends[base_legend] = used_legends.get(base_legend, 0) + 1
                 count = used_legends[base_legend]
                 legend = base_legend if count == 1 else f"{base_legend} ({count})"
-                curves.append((legend, data[:, x_index], data[:, y_index]))
+                curves.append((
+                    legend, data[:, x_index], data[:, y_index],
+                    filename, scan_label,
+                ))
             self._show_external_curves(curves, x_label, y_label)
         except Exception as error:
             qt.QMessageBox.critical(
@@ -1696,6 +2461,7 @@ class MainWindow(qt.QMainWindow):
 
     def _set_save_actions_enabled(self, enabled):
         for action in (
+            self.save_current_data_action,
             self.save_current_action,
             self.save_batch_plots_action,
             self.save_batch_video_action,
@@ -1780,7 +2546,6 @@ class MainWindow(qt.QMainWindow):
             grid.addWidget(button, row, 2)
         clear_mask = qt.QPushButton("Clear Mask")
         clear_mask.clicked.connect(self.clear_mask)
-        grid.addWidget(clear_mask, 3, 2)
         navigation = qt.QWidget()
         navigation_layout = qt.QHBoxLayout(navigation)
         navigation_layout.setContentsMargins(0, 0, 0, 0)
@@ -1788,6 +2553,7 @@ class MainWindow(qt.QMainWindow):
         self.next_image_button = qt.QPushButton("Next >")
         self.previous_image_button.clicked.connect(self.show_previous_image)
         self.next_image_button.clicked.connect(self.show_next_image)
+        navigation_layout.addWidget(clear_mask)
         navigation_layout.addWidget(self.previous_image_button)
         navigation_layout.addWidget(self.next_image_button)
         grid.addWidget(navigation, 4, 1, 1, 2)
@@ -1819,17 +2585,18 @@ class MainWindow(qt.QMainWindow):
         )
         self.radial_range_edit = qt.QLineEdit()
         self.azimuth_range_edit = qt.QLineEdit()
-        for edit in (self.radial_range_edit, self.azimuth_range_edit):
-            edit.setPlaceholderText("Auto")
-            edit.setToolTip("minimum, maximum")
+        self.radial_range_edit.setPlaceholderText("Auto")
+        self.radial_range_edit.setToolTip("minimum, maximum")
+        self.azimuth_range_edit.setPlaceholderText("Auto or 25,45; 135,155")
+        self.azimuth_range_edit.setToolTip(
+            "One or more degree ranges. Separate minimum,maximum pairs with "
+            "semicolons, for example: 25,45; 135,155"
+        )
         form.addRow("Number of points", self.points_spin)
         form.addRow("X-axis unit", self.unit_combo)
         form.addRow("Error model", self.error_model_combo)
         form.addRow("Radial range", self.radial_range_edit)
-        form.addRow("Azimuthal range (deg)", self.azimuth_range_edit)
-        self.cake_check = qt.QCheckBox("Cake")
-        self.cake_check.setToolTip("Calculate and display the 2-D cake integration")
-        form.addRow(self.cake_check)
+        form.addRow("Azimuthal ranges (deg)", self.azimuth_range_edit)
         self.show_empty_check = qt.QCheckBox("Show")
         self.subtract_empty_check = qt.QCheckBox("Subtract")
         self.empty_factor = qt.QDoubleSpinBox()
@@ -1938,14 +2705,18 @@ class MainWindow(qt.QMainWindow):
             source_position.layout().itemAt(4).widget().setText(
                 "<b>Intensity:</b>"
             )
+        self.source_sum_name_label = qt.QLabel("<b>Detector Sum:</b>")
+        self.source_sum_value_label = qt.QLabel("-")
+        self.source_sum_value_label.setTextInteractionFlags(
+            qt.Qt.TextSelectableByMouse
+        )
+        source_position.layout().addWidget(self.source_sum_name_label)
+        source_position.layout().addWidget(self.source_sum_value_label)
         source_colorbar = self.image_plot.getColorBarWidget()
         source_colorbar.setMinimumWidth(70)
         source_colorbar.setMaximumWidth(70)
         if source_colorbar.layout() is not None:
             source_colorbar.layout().setContentsMargins(2, 4, 2, 4)
-        self.source_sum_label = qt.QLabel("Detector sum intensity: no image loaded")
-        self.source_sum_label.setAlignment(qt.Qt.AlignCenter)
-        self.source_sum_label.setTextInteractionFlags(qt.Qt.TextSelectableByMouse)
         self.result_plot = Plot1D()
         self.result_plot.setGraphTitle("1D integration")
         self.result_plot.setGraphYLabel("Intensity")
@@ -1968,7 +2739,7 @@ class MainWindow(qt.QMainWindow):
         self.result_log_x_action.setVisible(True)
         self.result_log_y_action.setVisible(True)
         self.cake_log_x_action.setVisible(True)
-        self.cake_log_y_action.setVisible(False)
+        self.cake_log_y_action.setVisible(True)
         self.cake_log_x_action.toggled.connect(self._shared_log_x_changed)
         self.result_log_x_action.toggled.connect(self._shared_log_x_changed)
         self.result_plot.getYAxis().sigScaleChanged.connect(
@@ -2021,10 +2792,9 @@ class MainWindow(qt.QMainWindow):
         # immediately after Zoom/Pan so Qt does not move it into the overflow
         # menu when the toolbar is narrower than all available actions.
         self.cake_colormap_action = self.cake_plot.getColormapAction()
-        result_toolbar.insertAction(
-            interactive_separator, self.cake_colormap_action
-        )
-        self.cake_colormap_action.setVisible(False)
+        result_toolbar.insertAction(interactive_separator, self.cake_colormap_action)
+        result_toolbar.removeAction(self.cake_colormap_action)
+        self.cake_colormap_action.setVisible(True)
         # The native silx CopyAction renders through an in-memory PNG path that
         # can terminate Qt on Windows (0xC0000409). Replace it with a direct,
         # ownership-safe QImage copy of the same visible plots used by exports.
@@ -2068,12 +2838,24 @@ class MainWindow(qt.QMainWindow):
             self.cake_profile_separator.setVisible(False)
             for action in self.cake_profile_actions:
                 result_toolbar.addAction(action)
-                action.setVisible(False)
+                result_toolbar.removeAction(action)
+                action.setVisible(True)
         # Cake is operated by the same shared controls; hide every toolbar it
         # created internally so none can appear between Cake and 1-D.
         for toolbar in self.cake_plot.findChildren(qt.QToolBar):
             self.cake_plot.removeToolBar(toolbar)
             toolbar.setVisible(False)
+        # Keep detached widgets hidden until their final layout owns them.
+        # Showing either one here makes Qt briefly treat it as a top-level
+        # window during application startup.
+        cake_toolbar.setVisible(False)
+        for action in (
+            self.cake_log_x_action, self.cake_log_y_action,
+            self.cake_colormap_action, *self.cake_profile_actions,
+        ):
+            if action not in cake_toolbar.actions():
+                cake_toolbar.addAction(action)
+            action.setVisible(True)
         result_toolbar.setMovable(False)
         result_toolbar.setFloatable(False)
         result_toolbar.setVisible(True)
@@ -2086,19 +2868,14 @@ class MainWindow(qt.QMainWindow):
         if toolbar_extension is not None:
             toolbar_extension.setFixedSize(0, 0)
             toolbar_extension.setVisible(False)
-        cake_toolbar.setVisible(False)
         self.result_plot.resetZoomAction.triggered.connect(
             self._reset_integration_plots
         )
-        integration_panel = qt.QSplitter(qt.Qt.Vertical)
-        integration_panel.addWidget(self.cake_plot)
-        integration_panel.addWidget(self.result_plot)
-        integration_panel.setStretchFactor(0, 1)
-        integration_panel.setStretchFactor(1, 1)
-        integration_panel.setSizes([400, 400])
-        self.integration_splitter = integration_panel
-        self.cake_plot.setVisible(False)
-        self.cake_check.toggled.connect(self._cake_toggled)
+        integration_panel = qt.QWidget()
+        integration_panel_layout = qt.QVBoxLayout(integration_panel)
+        integration_panel_layout.setContentsMargins(0, 0, 0, 0)
+        integration_panel_layout.addWidget(self.result_plot, 1)
+        self._integration_panel_layout = integration_panel_layout
         integration_container = qt.QWidget()
         integration_layout = qt.QVBoxLayout(integration_container)
         integration_layout.setContentsMargins(0, 0, 0, 0)
@@ -2108,14 +2885,58 @@ class MainWindow(qt.QMainWindow):
         self._build_shared_position_bar(integration_layout)
         self.cake_toolbar = cake_toolbar
         self.result_toolbar = result_toolbar
+        cake_container = qt.QWidget()
+        cake_layout = qt.QVBoxLayout(cake_container)
+        cake_layout.setContentsMargins(0, 0, 0, 0)
+        cake_layout.setSpacing(0)
+        self.cake_button = qt.QPushButton("Calculate Cake")
+        self.cake_button.setToolTip(
+            "Calculate Cake and refresh the Cake and 1-D integration plots"
+        )
+        self.cake_button.clicked.connect(self._calculate_cake_clicked)
+        cake_toolbar.addWidget(self.cake_button)
+        cake_layout.addWidget(cake_toolbar)
+        cake_splitter = qt.QSplitter(qt.Qt.Vertical)
+        cake_plot_panel = qt.QWidget()
+        cake_plot_layout = qt.QVBoxLayout(cake_plot_panel)
+        cake_plot_layout.setContentsMargins(0, 0, 0, 0)
+        cake_plot_layout.setSpacing(0)
+        cake_plot_layout.addWidget(self.cake_plot, 1)
+        self.cake_position_bar = qt.QWidget()
+        cake_position_layout = qt.QHBoxLayout(self.cake_position_bar)
+        cake_position_layout.setContentsMargins(6, 1, 6, 1)
+        cake_position_layout.setSpacing(6)
+        self.cake_pos_value_label = qt.QLabel("-")
+        self.cake_q_value_label = qt.QLabel("-")
+        self.cake_intensity_value_label = qt.QLabel("-")
+        self.cake_azimuth_value_label = qt.QLabel("-")
+        for title, value_label in (
+            ("Pos:", self.cake_pos_value_label),
+            ("Q:", self.cake_q_value_label),
+            ("Intensity:", self.cake_intensity_value_label),
+            ("Azimuthal Angle:", self.cake_azimuth_value_label),
+        ):
+            cake_position_layout.addWidget(qt.QLabel(f"<b>{title}</b>"))
+            value_label.setTextInteractionFlags(qt.Qt.TextSelectableByMouse)
+            cake_position_layout.addWidget(value_label)
+        cake_position_layout.addStretch(1)
+        cake_splitter.addWidget(cake_plot_panel)
+        cake_splitter.setStretchFactor(0, 1)
+        cake_splitter.setChildrenCollapsible(False)
+        cake_layout.addWidget(cake_splitter, 1)
+        # As in pyFAI-calib2's Cake & Integration view, use one cursor status
+        # row below both plots rather than a separate row below Cake.
+        cake_layout.addWidget(self.cake_position_bar)
+        cake_toolbar.setVisible(True)
+        self.cake_plot.setVisible(True)
+        self.cake_splitter = cake_splitter
+        self.cake_container = cake_container
         source_container = qt.QWidget()
         source_layout = qt.QVBoxLayout(source_container)
         source_layout.setContentsMargins(0, 0, 0, 0)
-        source_layout.setSpacing(2)
+        source_layout.setSpacing(0)
         source_layout.addWidget(self.image_plot, 1)
-        source_layout.addWidget(self.source_sum_label)
         self.source_container = source_container
-
         self.detector_sum_plot = Plot1D()
         self.detector_sum_plot.setGraphTitle("Detector sum intensity")
         self.detector_sum_plot.setGraphXLabel("Image / frame index")
@@ -2148,18 +2969,20 @@ class MainWindow(qt.QMainWindow):
         roi_sum_layout.addWidget(self.roi_sum_plot, 1)
         self.right_stack = qt.QStackedWidget()
         self.right_stack.addWidget(integration_container)
+        self.right_stack.addWidget(cake_container)
         self.right_stack.addWidget(detector_sum_container)
         self.right_stack.addWidget(roi_sum_container)
         self.right_tab_bar = qt.QTabBar()
         self.right_tab_bar.addTab("Integration")
+        self.right_tab_bar.addTab("Cake")
         self.right_tab_bar.addTab("Detector Sum")
         self.right_tab_bar.addTab("ROI Sum")
         self.right_tab_bar.setExpanding(False)
         self.right_tab_bar.setDrawBase(False)
         self.right_tab_bar.setDocumentMode(True)
-        self.right_tab_bar.currentChanged.connect(
-            self.right_stack.setCurrentIndex
-        )
+        self.right_tab_bar.currentChanged.connect(self._right_tab_changed)
+        self.right_tab_bar.setCurrentIndex(0)
+        self.right_stack.setCurrentIndex(0)
 
         splitter.addWidget(source_container)
         splitter.addWidget(self.right_stack)
@@ -2170,6 +2993,18 @@ class MainWindow(qt.QMainWindow):
         layout.addWidget(splitter, 1)
 
         qt.QTimer.singleShot(0, self._update_plot_sizes)
+
+    @qt.Slot(int)
+    def _right_tab_changed(self, index):
+        """Show Cake above 1-D integration when the Cake tab is selected."""
+        if index == 1:
+            self.cake_splitter.addWidget(self.result_plot)
+            self.cake_splitter.setStretchFactor(0, 1)
+            self.cake_splitter.setStretchFactor(1, 1)
+            self.cake_splitter.setSizes([400, 400])
+        else:
+            self._integration_panel_layout.addWidget(self.result_plot, 1)
+        self.right_stack.setCurrentIndex(index)
 
     def _build_shared_position_bar(self, parent_layout):
         """Place Cake and 1-D cursor information in one shared bottom row."""
@@ -2204,7 +3039,12 @@ class MainWindow(qt.QMainWindow):
         self._shared_x_value_label = cake_info._fields[0][0]
         self._shared_1d_value_label = result_info._fields[1][0]
         self.result_plot.sigPlotSignal.connect(self._update_shared_x_from_1d)
+        self.result_plot.sigPlotSignal.connect(self._update_cake_1d_position_bar)
         self.cake_plot.sigPlotSignal.connect(self._update_shared_1d_from_cake)
+        self.cake_plot.sigPlotSignal.connect(self._update_cake_position_bar)
+        self.cake_plot._sigDefaultContextMenu.connect(
+            self._populate_cake_context_menu
+        )
         for widget in self._cake_position_widgets:
             widget.setVisible(False)
 
@@ -2228,6 +3068,116 @@ class MainWindow(qt.QMainWindow):
             "------" if not np.isfinite(value) else f"{value:.7g}"
         )
 
+    @qt.Slot(object)
+    def _update_cake_position_bar(self, event):
+        """Show Cake pixel position and q in the shared bottom status row."""
+        if event.get("event") != "mouseMoved":
+            return
+        q_value = float(event["x"])
+        azimuth = float(event["y"])
+        self.cake_q_value_label.setText(f"{q_value:.7g}")
+        self.cake_intensity_value_label.setText("-")
+        self.cake_azimuth_value_label.setText(f"{azimuth:.7g}°")
+        position = "-"
+        if self._last_integration_payload is not None:
+            cake = self._last_integration_payload.get("cake")
+            if cake is not None:
+                radial = np.asarray(cake.get("radial", []))
+                azimuthal = np.asarray(cake.get("azimuthal", []))
+                intensity = np.asarray(cake.get("intensity", []))
+                if (radial.size and azimuthal.size
+                        and intensity.shape == (azimuthal.size, radial.size)
+                        and radial.min() <= q_value <= radial.max()
+                        and azimuthal.min() <= azimuth <= azimuthal.max()):
+                    radial_index = int(np.abs(radial - q_value).argmin())
+                    azimuth_index = int(np.abs(azimuthal - azimuth).argmin())
+                    position = f"px={radial_index}, py={azimuth_index}"
+        self.cake_pos_value_label.setText(position)
+
+    @qt.Slot(object)
+    def _update_cake_1d_position_bar(self, event):
+        """Show q and intensity while the cursor is over the 1-D plot."""
+        if event.get("event") != "mouseMoved":
+            return
+        self.cake_pos_value_label.setText("-")
+        self.cake_q_value_label.setText(f"{float(event['x']):.7g}")
+        self.cake_intensity_value_label.setText(f"{float(event['y']):.7g}")
+        self.cake_azimuth_value_label.setText("-")
+
+    def _populate_cake_context_menu(self, menu):
+        """Add pyFAI-calib2's pixel marker command to Cake's right-click menu."""
+        handle = self.cake_plot.getWidgetHandle()
+        position = handle.mapFromGlobal(qt.QCursor.pos())
+        q_value, azimuth = self.cake_plot.pixelToData(
+            position.x(), position.y()
+        )
+        menu.addSeparator()
+        action = qt.QAction("Mark this pixel coord", menu)
+        action.setEnabled(self.image_data is not None and self.integrator is not None)
+        action.triggered.connect(
+            lambda _checked=False, q=q_value, chi=azimuth:
+            self._mark_cake_coordinate(q, chi)
+        )
+        menu.addAction(action)
+
+    def _mark_cake_coordinate(self, q_value, azimuth):
+        """Project a Cake coordinate to a detector pixel like pyFAI-calib2."""
+        if self.image_data is None or self.integrator is None:
+            return
+        q_value = float(q_value)
+        azimuth = float(azimuth)
+        shape = self.image_data.shape
+        radial_unit = pyFAI.units.to_unit(self.unit_combo.currentText())
+        wavelength = self.integrator.wavelength
+        inverse_key = (
+            id(self.integrator), tuple(shape), str(radial_unit), wavelength,
+        )
+        if inverse_key != self._cake_inverse_geometry_key:
+            self._cake_inverse_geometry = InvertGeometry(
+                self.integrator.center_array(
+                    shape=shape, unit=radial_unit, scale=True
+                ),
+                self.integrator.center_array(
+                    shape=shape, unit="chi_deg", scale=True
+                ),
+            )
+            self._cake_inverse_geometry_key = inverse_key
+        pixel_y, pixel_x = self._cake_inverse_geometry(q_value, azimuth, True)
+        try:
+            direct_dist = self.integrator.getFit2D()["directDist"]
+        except Exception:
+            direct_dist = None
+        try:
+            tth_requested = unitutils.tthToRad(
+                q_value, unit=radial_unit, wavelength=wavelength,
+                directDist=direct_dist,
+            )
+        except Exception:
+            tth_requested = None
+        if tth_requested is None:
+            self.status_label.setText("Unable to convert the Cake coordinate to 2θ")
+            return
+        ax = np.asarray([pixel_x])
+        ay = np.asarray([pixel_y])
+        tth_from_pixel = self.integrator.tth(ay, ax)[0]
+        chi_from_pixel = self.integrator.chi(ay, ax)[0]
+        error = np.sqrt(
+            (tth_requested - tth_from_pixel) ** 2
+            + (np.deg2rad(azimuth) - chi_from_pixel) ** 2
+        )
+        if not np.isfinite(error) or error > 0.05:
+            self.status_label.setText(
+                "No detector pixel matches this Cake coordinate closely enough"
+            )
+            return
+        column = float(pixel_x)
+        row = float(pixel_y)
+        self._cake_markers.append((column, row))
+        self._update_image_plot(resetzoom=False)
+        self.status_label.setText(
+            f"Marked detector pixel column {column}, row {row} from Cake"
+        )
+
     def _reference_controls(self, show, subtract, factor):
         widget = qt.QWidget()
         layout = qt.QHBoxLayout(widget)
@@ -2238,26 +3188,22 @@ class MainWindow(qt.QMainWindow):
         layout.addWidget(factor)
         return widget
 
-    @qt.Slot(bool)
-    def _cake_toggled(self, checked):
-        """Show Cake only when requested and calculate it on the next integration."""
-        self.cake_plot.setVisible(checked)
-        self.cake_colormap_action.setVisible(checked)
-        self.result_log_y_action.setVisible(True)
+    @qt.Slot()
+    def _calculate_cake_clicked(self):
+        """Request Cake calculation and run the shared integration pipeline."""
+        self._cake_requested = True
+        self.cake_colormap_action.setVisible(True)
         self.cake_log_x_action.setVisible(True)
         for widget in self._cake_position_widgets:
-            widget.setVisible(checked)
+            widget.setVisible(True)
         for action in self.cake_profile_actions:
-            action.setVisible(checked)
+            action.setVisible(True)
         if self.cake_profile_separator is not None:
-            self.cake_profile_separator.setVisible(checked)
-        if checked:
-            self.cake_log_x_action.setChecked(
-                self.result_plot.getXAxis().getScale() == "log"
-            )
-            self.integration_splitter.setSizes([400, 400])
-        else:
-            self.integration_splitter.setSizes([0, 800])
+            self.cake_profile_separator.setVisible(True)
+        self.cake_log_x_action.setChecked(
+            self.result_plot.getXAxis().getScale() == "log"
+        )
+        self.start_integration(self._last_integration_payload)
 
     @qt.Slot(bool)
     def _shared_log_x_changed(self, checked):
@@ -2268,7 +3214,7 @@ class MainWindow(qt.QMainWindow):
         # An image whose left extent is exactly zero is not drawable on a log
         # axis. Re-add Cake with only its non-positive edge columns omitted.
         # This changes display only; the cached integration remains untouched.
-        if (self.cake_check.isChecked()
+        if (self._cake_requested
                 and self._last_integration_payload is not None
                 and self._last_integration_payload.get("cake") is not None):
             self._render_cake_image(
@@ -2338,12 +3284,12 @@ class MainWindow(qt.QMainWindow):
     @qt.Slot()
     def _reset_integration_plots(self):
         """Reset both plots from the single shared integration toolbar."""
-        if self.cake_check.isChecked():
+        if self._cake_requested:
             self.cake_plot.resetZoom()
 
     @qt.Slot(float, float)
     def _result_x_limits_changed(self, minimum, maximum):
-        if self._syncing_integration_x or not self.cake_check.isChecked():
+        if self._syncing_integration_x:
             return
         self._syncing_integration_x = True
         try:
@@ -2353,7 +3299,7 @@ class MainWindow(qt.QMainWindow):
 
     @qt.Slot(float, float)
     def _cake_x_limits_changed(self, minimum, maximum):
-        if self._syncing_integration_x or not self.cake_check.isChecked():
+        if self._syncing_integration_x:
             return
         self._syncing_integration_x = True
         try:
@@ -2740,9 +3686,11 @@ class MainWindow(qt.QMainWindow):
         scroll_bar = self.export_progress.verticalScrollBar()
         scroll_bar.setValue(scroll_bar.maximum())
 
-    def _update_subtraction_status_block(self, sample_index=None):
+    def _update_subtraction_status_block(
+        self, sample_index=None, sample_sources=None
+    ):
         """Show matched subtraction files inside the existing Status panel."""
-        text = self._subtraction_reference_text(sample_index)
+        text = self._subtraction_reference_text(sample_index, sample_sources)
         if text:
             self._fixed_status_blocks["subtraction"] = (
                 f"Subtraction:\n    {text}"
@@ -2780,6 +3728,7 @@ class MainWindow(qt.QMainWindow):
         self._cake_cache.clear()
         self._reference_curve_cache.clear()
         self.mask_data = None
+        self._cake_markers.clear()
         self.poni_edit.clear()
         self.mask_edit.clear()
         self._show_detector_information()
@@ -2851,6 +3800,11 @@ class MainWindow(qt.QMainWindow):
                 scale=(step, step), colormap=mask_colormap, z=10,
                 resetzoom=False,
             )
+        for index, (column, row) in enumerate(self._cake_markers):
+            self.image_plot.addMarker(
+                column, row, legend=f"cake mask {index + 1}",
+                text="×", color="red", symbol="x",
+            )
         self.image_plot.setActiveImage("detector image")
         return step
 
@@ -2886,21 +3840,14 @@ class MainWindow(qt.QMainWindow):
         return self.image_data[row, column]
 
     def _update_source_sum_label(self):
-        """Display only a cached Calculate result; never sum during Integrate."""
+        """Display the current image's detector sum in the Plot2D status row."""
         if self.image_data is None:
-            self.source_sum_label.setText(
-                "Detector sum intensity: no image loaded"
-            )
+            self.source_sum_value_label.setText("-")
             return
         value = self._detector_sum_by_source.get(self._current_source_key())
         if value is None:
-            self.source_sum_label.setText(
-                "Detector sum intensity: not calculated"
-            )
-            return
-        self.source_sum_label.setText(
-            f"Detector sum intensity (calculated): {int(value):,d}"
-        )
+            value = masked_intensity_sum(self.image_data, self._effective_mask())
+        self.source_sum_value_label.setText(f"{int(value):,d}")
 
     def _roi_added(self, roi):
         """Keep one rectangle and cache its full-resolution pixel bounds."""
@@ -3651,15 +4598,55 @@ class MainWindow(qt.QMainWindow):
     def _integration_ranges(self):
         return (
             self._optional_range(self.radial_range_edit, "radial range"),
-            self._optional_range(self.azimuth_range_edit, "azimuthal range"),
+            self._optional_azimuth_ranges(),
         )
+
+    def _optional_azimuth_ranges(self):
+        """Parse one or more ``minimum,maximum`` azimuthal ranges."""
+        text = self.azimuth_range_edit.text().strip()
+        if not text or text.casefold() == "auto":
+            return None
+        number = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+        pattern = re.compile(rf"({number})\s*,\s*({number})")
+        ranges = []
+        for item in text.split(";"):
+            match = pattern.fullmatch(item.strip())
+            if match is None:
+                raise ValueError(
+                    "Enter azimuthal ranges as minimum,maximum pairs separated "
+                    "by semicolons, for example: 25,45; 135,155"
+                )
+            lower, upper = float(match.group(1)), float(match.group(2))
+            if not (-180.0 <= lower < upper <= 180.0):
+                raise ValueError(
+                    "Each azimuthal range must satisfy -180 <= minimum < "
+                    "maximum <= 180 degrees"
+                )
+            ranges.append((lower, upper))
+        return tuple(ranges)
 
     def _error_model(self):
         """Return pyFAI's error-model token, or None when errors are disabled."""
         return self.error_model_combo.currentData()
 
+    def _integration_context(self, radial_range, azimuth_range):
+        """Identify the inputs that determine the displayed 1-D sample curve."""
+        poni = self.poni_edit.text().strip()
+        try:
+            poni_mtime = os.path.getmtime(poni)
+        except OSError:
+            poni_mtime = None
+        mask = self._effective_mask()
+        return (
+            self._current_source_key(), os.path.abspath(poni), poni_mtime,
+            None if self.integrator is None else self.integrator.wavelength,
+            self.points_spin.value(), self.unit_combo.currentText(),
+            radial_range, azimuth_range, self._error_model(),
+            None if mask is None else (tuple(mask.shape), mask_checksum(mask)),
+        )
+
     @qt.Slot()
-    def start_integration(self):
+    def start_integration(self, reuse_payload=None):
         if self.image_data is None:
             self.show_error("Image Required", "Select a 2-D diffraction image first.")
             return
@@ -3676,6 +4663,9 @@ class MainWindow(qt.QMainWindow):
         except ValueError as exc:
             self.show_error("Invalid Parameters", str(exc))
             return
+        integration_context = self._integration_context(radial_range, azimuth_range)
+        if integration_context != self._last_1d_context:
+            reuse_payload = None
 
         references = []
         for name, data, filename, show, subtract, factor in (
@@ -3706,6 +4696,7 @@ class MainWindow(qt.QMainWindow):
             "operation", "Integration", "running…"
         )
         cake_cache_key = self._cake_cache_key(radial_range, azimuth_range)
+        self._pending_1d_context = integration_context
         # IntegrationWorker performs pyFAI 1-D integration and optional Cake /
         # reference work only. Detector Sum and ROI Sum are never calculated
         # here; their cached values are produced exclusively by Calculate.
@@ -3714,10 +4705,11 @@ class MainWindow(qt.QMainWindow):
             self.points_spin.value(), self.unit_combo.currentText(), radial_range,
             azimuth_range, self._error_model(),
             references,
-            self.cake_check.isChecked(),
+            self._cake_requested,
             self._cake_cache.get(cake_cache_key)
-            if self.cake_check.isChecked() else None,
+            if self._cake_requested else None,
             cake_cache_key,
+            reuse_payload,
         )
         if self._exporting_video:
             payloads = []
@@ -3794,9 +4786,35 @@ class MainWindow(qt.QMainWindow):
         """Capture exactly the visible plot canvases, without GUI controls."""
         source = self.image_plot.getWidgetHandle().grab().toImage()
         current = self.right_stack.currentWidget()
-        if current in (self.detector_sum_container, self.roi_sum_container):
+        if current is self.cake_container:
+            cake = self.cake_plot.getWidgetHandle().grab().toImage()
+            result = self.result_plot.getWidgetHandle().grab().toImage()
+            width = max(cake.width(), result.width())
+            right = qt.QImage(
+                width, cake.height() + result.height(), qt.QImage.Format_RGB888
+            )
+            right.fill(qt.QColor("white"))
+            painter = qt.QPainter(right)
+            painter.drawImage((width - cake.width()) // 2, 0, cake)
+            painter.drawImage((width - result.width()) // 2, cake.height(), result)
+            painter.end()
+            height = max(source.height(), right.height())
+            combined = qt.QImage(
+                source.width() + right.width(), height, qt.QImage.Format_RGB888
+            )
+            combined.fill(qt.QColor("white"))
+            painter = qt.QPainter(combined)
+            painter.drawImage(0, (height - source.height()) // 2, source)
+            painter.drawImage(source.width(), (height - right.height()) // 2, right)
+            painter.end()
+            return combined
+        if current in (
+            self.cake_container, self.detector_sum_container,
+            self.roi_sum_container,
+        ):
             plot = (
-                self.detector_sum_plot
+                self.cake_plot if current is self.cake_container
+                else self.detector_sum_plot
                 if current is self.detector_sum_container else self.roi_sum_plot
             )
             right = plot.getWidgetHandle().grab().toImage()
@@ -3813,7 +4831,7 @@ class MainWindow(qt.QMainWindow):
             painter.end()
             return combined
         result = self.result_plot.getWidgetHandle().grab().toImage()
-        if self.cake_check.isChecked():
+        if self._cake_requested:
             cake = self.cake_plot.getWidgetHandle().grab().toImage()
             right_width = max(cake.width(), result.width())
             right_height = cake.height() + result.height()
@@ -3867,6 +4885,96 @@ class MainWindow(qt.QMainWindow):
         return True
 
     @qt.Slot()
+    def save_current_integrated_data(self):
+        """Write the already displayed 1-D result without reintegrating it."""
+        if not self.image_paths or self._last_integration_payload is None:
+            self.show_error(
+                "No Integrated Data", "Integrate the current image before saving."
+            )
+            return
+        source = self.image_paths[self.image_index]
+        default_name = source.data_filename
+        if (
+            self._measurement_mode == "asaxs"
+            and source.energy_ev is not None
+        ):
+            output_name = Path(default_name)
+            default_name = (
+                f"{output_name.stem}_E{source.energy_ev}{output_name.suffix}"
+            )
+        filename, _ = qt.QFileDialog.getSaveFileName(
+            self, "Save Current Integrated ASCII Data",
+            str(Path(self.export_path) / default_name),
+            "ASCII data (*.dat);;All files (*)",
+            options=qt.QFileDialog.DontUseNativeDialog,
+        )
+        if not filename:
+            return
+        if not Path(filename).suffix:
+            filename += ".dat"
+        self._set_export_path(Path(filename).parent)
+        try:
+            self._write_current_ascii(filename, source)
+        except (OSError, TypeError, ValueError, IndexError) as exc:
+            self.show_error("ASCII Data Export Failed", str(exc))
+            return
+        self.status_label.setText(f"Saved current integrated data to {filename}")
+        self._append_export_progress(f"Current ASCII saved: {Path(filename).name}")
+
+    def _write_current_ascii(self, filename, source):
+        """Write current payload using the same columns as the batch writer."""
+        payload = self._last_integration_payload
+        radial = np.asarray(payload["radial"])
+        sample = np.asarray(payload["sample"])
+        keep = np.ones(radial.shape, dtype=bool)
+        if self._filtered_payload is payload and self._current_filter[2]:
+            criterion, _show_points, _delete_points, x_range = self._current_filter
+            outliers = self._filter_outlier_mask(sample, criterion)
+            if x_range is not None:
+                x_minimum, x_maximum = sorted(x_range)
+                outliers &= (radial >= x_minimum) & (radial <= x_maximum)
+            keep &= ~outliers
+
+        columns = [radial[keep], sample[keep]]
+        column_names = [str(payload["unit"]), "Intensity"]
+        sigma = payload.get("sigma")
+        if sigma is not None:
+            columns.append(np.asarray(sigma)[keep])
+            column_names.append("Sigma")
+
+        comments = []
+        if source.energy_ev is not None:
+            comments.append(f"Energy: {source.energy_ev} eV")
+            wavelength = (
+                self.integrator.wavelength if self.integrator is not None
+                else wavelength_from_energy(source.energy_ev)
+            )
+            comments.append(f"Wavelength used: {wavelength:.12g} m")
+
+        references = payload.get("references", {})
+        if references:
+            columns.append(np.asarray(payload["corrected"])[keep])
+            column_names.append("Subtracted")
+            for name, (intensity, _show, _subtract, factor) in references.items():
+                columns.append((factor * np.asarray(intensity))[keep])
+                column_names.append(name)
+                kind = name.casefold()
+                reference_sources = self._reference_sources.get(kind, [])
+                if reference_sources:
+                    reference = matching_reference_source(
+                        reference_sources, source,
+                        self.image_paths, self.image_index,
+                    )
+                    comments.append(
+                        f"{name} file: {reference.title}; factor: {factor:.2f}"
+                    )
+
+        np.savetxt(
+            filename, np.column_stack(columns), fmt="%.10e", delimiter="\t",
+            header="\n".join(comments + ["\t".join(column_names)]),
+        )
+
+    @qt.Slot()
     def save_all_integrated_data(self):
         if not self.image_paths:
             self.show_error("No Images", "Load one or more images first.")
@@ -3889,7 +4997,7 @@ class MainWindow(qt.QMainWindow):
 
         self._start_ascii_export(output_dir, reset_progress=True)
 
-    def _start_ascii_export(self, output_dir, reset_progress=True):
+    def _start_ascii_export(self, output_dir, reset_progress=True, sources=None):
         """Start the existing batch ASCII writer in a chosen directory."""
 
         poni = self.poni_edit.text().strip()
@@ -3907,22 +5015,51 @@ class MainWindow(qt.QMainWindow):
         if reset_progress:
             self._reset_export_progress()
         self._append_export_progress("Integrated data:")
+        export_sources = list(self.image_paths if sources is None else sources)
+        if not export_sources:
+            self.show_error("No Images", "No image data is available for export.")
+            return
+        self._batch_export_sources = export_sources
         references = []
-        if self._reference_sources["empty"]:
-            references.append((
-                "Empty", list(self._reference_sources["empty"]),
-                self.empty_edit.text().strip(),
-                self.empty_factor.value(), self.subtract_empty_check.isChecked(),
-            ))
-        if self._reference_sources["background"]:
-            references.append((
-                "Background", list(self._reference_sources["background"]),
-                self.background_edit.text().strip(),
-                self.background_factor.value(), self.subtract_background_check.isChecked(),
-            ))
+        try:
+            if self._reference_sources["empty"]:
+                empty_sources = list(self._reference_sources["empty"])
+                if sources is not None:
+                    empty_sources = [
+                        matching_reference_source(
+                            empty_sources, source, self.image_paths,
+                            self.image_paths.index(source),
+                        )
+                        for source in export_sources
+                    ]
+                references.append((
+                    "Empty", empty_sources,
+                    self.empty_edit.text().strip(),
+                    self.empty_factor.value(), self.subtract_empty_check.isChecked(),
+                ))
+            if self._reference_sources["background"]:
+                background_sources = list(self._reference_sources["background"])
+                if sources is not None:
+                    background_sources = [
+                        matching_reference_source(
+                            background_sources, source, self.image_paths,
+                            self.image_paths.index(source),
+                        )
+                        for source in export_sources
+                    ]
+                references.append((
+                    "Background", background_sources,
+                    self.background_edit.text().strip(),
+                    self.background_factor.value(),
+                    self.subtract_background_check.isChecked(),
+                ))
+        except (ValueError, IndexError) as exc:
+            self._batch_export_sources = []
+            self.show_error("Reference Matching Failed", str(exc))
+            return
         self._batch_thread = qt.QThread(self)
         self._batch_worker = BatchIntegrationWorker(
-            list(self.image_paths), output_dir, poni, self.mask_data,
+            export_sources, output_dir, poni, self.mask_data,
             self.points_spin.value(), self.unit_combo.currentText(), radial_range,
             azimuth_range, self._error_model(),
             references, self._measurement_mode in ("asaxs", "awaxs"),
@@ -3944,6 +5081,7 @@ class MainWindow(qt.QMainWindow):
         self._batch_worker_result = None
         self._batch_worker_error = None
         self.integrate_button.setEnabled(False)
+        self.save_current_data_action.setEnabled(False)
         self.save_current_action.setEnabled(False)
         self.save_batch_plots_action.setEnabled(False)
         self.save_batch_video_action.setEnabled(False)
@@ -3959,15 +5097,16 @@ class MainWindow(qt.QMainWindow):
 
     @qt.Slot(int, int, str)
     def _batch_data_progress(self, current, total, filename):
+        sources = self._batch_export_sources or self.image_paths
         source_progress = self._source_file_frame_progress(
-            self.image_paths, current - 1
+            sources, current - 1
         )
         self.status_label.setText(
             f"Saving [{current}/{total}]; {source_progress}"
         )
-        self._update_subtraction_status_block(current - 1)
+        self._update_subtraction_status_block(current - 1, sources)
         self._update_scrolling_filename(
-            self.image_paths[current - 1], "data"
+            sources[current - 1], "data"
         )
 
     @qt.Slot(str, int)
@@ -4038,12 +5177,14 @@ class MainWindow(qt.QMainWindow):
             self._start_next_combined_plot()
             return
         self.integrate_button.setEnabled(True)
+        self.save_current_data_action.setEnabled(True)
         self.save_current_action.setEnabled(True)
         self.save_batch_plots_action.setEnabled(True)
         self.save_batch_video_action.setEnabled(True)
         self.save_data_action.setEnabled(True)
         self.save_ascii_video_action.setEnabled(True)
         self._update_navigation_buttons()
+        self._batch_export_sources = []
         self.status_label.setText(f"Saved {count} integrated .dat files to {output_dir}")
         self._append_export_progress(f"Complete: [{count}/{count}]")
 
@@ -4052,12 +5193,14 @@ class MainWindow(qt.QMainWindow):
         self._combined_export_video_dir = None
         self._combined_export_plot_path = None
         self.integrate_button.setEnabled(True)
+        self.save_current_data_action.setEnabled(True)
         self.save_current_action.setEnabled(True)
         self.save_batch_plots_action.setEnabled(True)
         self.save_batch_video_action.setEnabled(True)
         self.save_data_action.setEnabled(True)
         self.save_ascii_video_action.setEnabled(True)
         self._update_navigation_buttons()
+        self._batch_export_sources = []
         self.show_error("ASCII Data Export Failed", details)
         self.status_label.setText("Integrated ASCII data export failed")
         self._append_export_progress("Integrated data: failed")
@@ -4102,6 +5245,7 @@ class MainWindow(qt.QMainWindow):
         self.image_paths = list(sources)
         self._exporting_video = True
         self._auto_integrate_images = True
+        self.save_current_data_action.setEnabled(False)
         self.save_current_action.setEnabled(False)
         self.save_batch_plots_action.setEnabled(False)
         self.save_batch_video_action.setEnabled(False)
@@ -4142,8 +5286,24 @@ class MainWindow(qt.QMainWindow):
         self, output_dir, reset_progress=True, grouped_sources=None
     ):
         """Start grouped video export in an already selected directory."""
-
-        self._batch_video_original_paths = list(self.image_paths)
+        # A combined ASCII/plot/video export can finish its plot phase after
+        # that phase has already released its temporary image_paths reference.
+        # The grouped source list still contains the complete ordered source
+        # set, so use it as a safe restoration snapshot in that case.
+        if self.image_paths is None:
+            if grouped_sources is None:
+                self.show_error(
+                    "Video Export Failed", "No image sources are available."
+                )
+                self._set_save_actions_enabled(True)
+                return
+            original_paths = [
+                source for _prefix, sources in grouped_sources
+                for source in sources
+            ]
+        else:
+            original_paths = list(self.image_paths)
+        self._batch_video_original_paths = original_paths
         self._batch_video_original_index = self.image_index
         self._batch_video_original_auto = self._auto_integrate_images
         self._batch_video_queue = []
@@ -4321,7 +5481,7 @@ class MainWindow(qt.QMainWindow):
                     )
                 else:
                     self._combined_export_video_groups.append(
-                        (prefix, ordered, str(Path(output_dir) / f"{prefix}.mp4"))
+                        (prefix, ordered)
                     )
         else:
             source = self.image_paths[0]
@@ -4415,6 +5575,7 @@ class MainWindow(qt.QMainWindow):
             original_auto = self._batch_video_original_auto
             self._batch_video_original_paths = None
             self._batch_video_queue.clear()
+        self.save_current_data_action.setEnabled(True)
         self.save_current_action.setEnabled(True)
         self.save_batch_plots_action.setEnabled(True)
         self.save_batch_video_action.setEnabled(True)
@@ -4472,6 +5633,11 @@ class MainWindow(qt.QMainWindow):
     @qt.Slot(object)
     def integration_finished(self, payload):
         self._last_integration_payload = payload
+        self._last_1d_context = self._pending_1d_context
+        self._pending_1d_context = None
+        # A filter is an explicit operation on one displayed result. A newly
+        # integrated image always starts from its unfiltered data.
+        self._filtered_payload = None
         if payload.get("cake") is not None:
             self._cake_cache[payload["cake_cache_key"]] = payload["cake"]
         for name, cache_key in payload.get("reference_cache_keys", {}).items():
@@ -4515,22 +5681,44 @@ class MainWindow(qt.QMainWindow):
         )
         self._start_next_combined_plot()
 
-    def _render_integration_payload(self, payload):
+    def _render_integration_payload(self, payload, preserve_view=False):
+        x_limits = (
+            self.result_plot.getXAxis().getLimits() if preserve_view else None
+        )
+        y_limits = (
+            self.result_plot.getYAxis().getLimits() if preserve_view else None
+        )
         radial = payload["radial"]
         cake = payload.get("cake")
-        if cake is not None and cake["radial"].size and cake["azimuthal"].size:
+        if (
+            not preserve_view and cake is not None
+            and cake["radial"].size and cake["azimuthal"].size
+        ):
             self._render_cake_image(payload, resetzoom=True)
         corrected_used = any(
             values[2] for values in payload["references"].values()
         )
+        filtering = payload is self._filtered_payload
+        criterion, show_points, delete_points, x_range = self._current_filter
+        outliers = (
+            self._filter_outlier_mask(payload["sample"], criterion)
+            if filtering else np.zeros(np.asarray(payload["sample"]).shape, dtype=bool)
+        )
+        if filtering and x_range is not None:
+            x_minimum, x_maximum = sorted(x_range)
+            outliers &= (radial >= x_minimum) & (radial <= x_maximum)
+        delete_outliers = filtering and delete_points and np.any(outliers)
+        keep = ~outliers if delete_outliers else slice(None)
+        plotted_radial = radial[keep]
         self.result_plot.clear()
         self.result_plot.addCurve(
-            radial, payload["sample"], legend="Data", resetzoom=True
+            plotted_radial, payload["sample"][keep], legend="Data",
+            resetzoom=not preserve_view,
         )
         if corrected_used:
             self.result_plot.addCurve(
-                radial, payload["corrected"], legend="Subtracted data",
-                resetzoom=False,
+                plotted_radial, payload["corrected"][keep], legend="Subtracted data",
+                linestyle="--", resetzoom=False,
             )
         for name, (intensity, _show, _subtract, factor) in payload["references"].items():
             show = (
@@ -4539,9 +5727,15 @@ class MainWindow(qt.QMainWindow):
             )
             if show:
                 self.result_plot.addCurve(
-                    radial, factor * intensity, legend=name,
+                    plotted_radial, (factor * intensity)[keep], legend=name,
                     resetzoom=False,
                 )
+        if filtering and show_points and not delete_points and np.any(outliers):
+            self.result_plot.addCurve(
+                radial[outliers], payload["sample"][outliers],
+                legend="Filtered points", color="#e53935", linestyle="",
+                symbol="o", resetzoom=False,
+            )
         self.result_plot.setGraphXLabel(payload["unit"])
         self.result_plot.setGraphYLabel("Intensity")
         self.result_plot.replot()
@@ -4550,7 +5744,12 @@ class MainWindow(qt.QMainWindow):
         self._refresh_result_legend()
         # clear()/addCurve() can leave a programmatically checked silx action
         # out of sync with its axis. Reapply after every integration redraw.
-        self._apply_p62_result_scale()
+        if not preserve_view:
+            self._apply_p62_result_scale()
+        if preserve_view:
+            self.result_plot.getXAxis().setLimits(*x_limits)
+            self.result_plot.getYAxis().setLimits(*y_limits)
+            self.result_plot.replot()
 
     def _render_cake_image(self, payload, resetzoom):
         """Render Cake with a strictly positive X extent on a logarithmic axis."""
@@ -4560,7 +5759,9 @@ class MainWindow(qt.QMainWindow):
         intensity = np.asarray(cake["intensity"])
         positive_intensity = intensity[np.isfinite(intensity) & (intensity > 0)]
         if positive_intensity.size:
-            cake_vmin, cake_vmax = np.percentile(positive_intensity, (1.0, 99.5))
+            # Keep low-but-valid Cake intensities visible.  The 1st percentile
+            # clipped the high-q tail (often below 1) to the darkest color.
+            cake_vmin, cake_vmax = np.percentile(positive_intensity, (0.1, 99.5))
             if cake_vmin >= cake_vmax:
                 cake_vmin = float(positive_intensity.min())
                 cake_vmax = float(positive_intensity.max())
@@ -4588,13 +5789,30 @@ class MainWindow(qt.QMainWindow):
                 self.cake_plot.clear()
                 return
             start = int(positive[0])
+        # Keep only azimuth rows containing actual finite Cake data.  The
+        # integration itself uses the full -180..180 range so both extremes
+        # remain visible whenever they have data; empty edge angles are hidden.
+        full_azimuth_axis = (
+            azimuth_axis.size > 1
+            and azimuth_axis[0] <= -179.0
+            and azimuth_axis[-1] >= 179.0
+        )
+        valid_azimuth = np.any(np.isfinite(intensity), axis=1)
+        azimuth_indices = np.flatnonzero(valid_azimuth)
+        if full_azimuth_axis:
+            azimuth_start, azimuth_end = 0, intensity.shape[0]
+        else:
+            azimuth_start = int(azimuth_indices[0]) if azimuth_indices.size else 0
+            azimuth_end = int(azimuth_indices[-1]) + 1 if azimuth_indices.size else intensity.shape[0]
+        intensity = intensity[azimuth_start:azimuth_end, start:]
+        azimuth_axis = azimuth_axis[azimuth_start:azimuth_end]
         self.cake_plot.clear()
         cake_colormap = Colormap()
         cake_colormap.setFromColormap(self.cake_plot.getDefaultColormap())
         if cake_colormap.getVRange() == (None, None):
             cake_colormap.setVRange(float(cake_vmin), float(cake_vmax))
         self.cake_plot.addImage(
-            intensity[:, start:],
+            intensity,
             legend="cake",
             origin=(
                 float(radial_axis[start] - radial_step / 2.0),
@@ -4605,6 +5823,8 @@ class MainWindow(qt.QMainWindow):
             resetzoom=resetzoom,
         )
         active_image = self.cake_plot.getActiveImage()
+        if full_azimuth_axis:
+            self.cake_plot.getYAxis().setLimits(-180.0, 180.0)
         active_colormap = active_image.getColormap()
         if self._cake_colormap_signal_source is not None:
             try:

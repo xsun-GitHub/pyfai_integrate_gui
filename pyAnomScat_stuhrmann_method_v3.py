@@ -10,6 +10,10 @@ import pyqtgraph as pg
 import re
 from scanf import scanf 
 import xraydb
+try:
+    from asaxs_global_fit import fit_asaxs_global
+except ImportError:
+    fit_asaxs_global = None
 
 # globel parameters that can be modified later or recovered later
 param = dict()
@@ -39,6 +43,21 @@ param['feff_plot_linewidth'] = 1
 
 def str2bool(value):
     return value.lower() in ("yes", "true", "t", "1", b'true')
+
+
+def uncertainty_kind_from_column_name(name):
+    """Return ``sigma``/``variance`` when an ASCII column name identifies it."""
+    normalized = str(name).strip().casefold().replace('-', '_').replace(' ', '_')
+    sigma_names = {
+        'sigma', 'error', 'errors', 'uncertainty', 'uncertainties',
+        'std', 'stdev', 'stddev', 'standard_deviation',
+    }
+    variance_names = {'variance', 'var', 'variances'}
+    if normalized in sigma_names:
+        return 'sigma'
+    if normalized in variance_names:
+        return 'variance'
+    return None
 
 
 class PeriodicTableDialog(QtWidgets.QDialog):
@@ -117,6 +136,77 @@ class PeriodicTableDialog(QtWidgets.QDialog):
         self.accept()
 
 
+class XYSelectionDialog(QtWidgets.QDialog):
+    """Select X, Y, and an optional uncertainty column for ASCII files."""
+
+    def __init__(self, choices, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select ASCII Data Columns for All Files")
+        layout = QtWidgets.QFormLayout(self)
+        self.x_combo = QtWidgets.QComboBox(self)
+        self.y_combo = QtWidgets.QComboBox(self)
+        self.error_combo = QtWidgets.QComboBox(self)
+        self.error_kind_combo = QtWidgets.QComboBox(self)
+        self.x_combo.addItems(choices)
+        self.y_combo.addItems(choices)
+        self.error_combo.addItem("None")
+        self.error_combo.addItems(choices)
+        self.error_kind_combo.addItems(("Sigma", "Variance"))
+        self.x_combo.setCurrentIndex(0)
+        self.y_combo.setCurrentIndex(min(1, len(choices) - 1))
+        self.error_combo.setCurrentIndex(0)
+        self.error_kind_combo.setEnabled(False)
+        layout.addRow("X data", self.x_combo)
+        layout.addRow("Y data", self.y_combo)
+        layout.addRow("Uncertainty data", self.error_combo)
+        layout.addRow("Uncertainty type", self.error_kind_combo)
+        self.error_combo.currentIndexChanged.connect(
+            self._error_column_changed
+        )
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+    def _error_column_changed(self, index):
+        self.error_kind_combo.setEnabled(index > 0)
+        if index <= 0:
+            return
+        # Choices are formatted as "Column N: name" when a comment header is
+        # available. Automatically reflect Sigma/Variance from that name.
+        choice = self.error_combo.currentText()
+        column_name = choice.split(':', 1)[-1].strip()
+        detected_kind = uncertainty_kind_from_column_name(column_name)
+        if detected_kind is not None:
+            self.error_kind_combo.setCurrentText(detected_kind.title())
+
+    def accept(self):
+        error_index = self.error_combo.currentIndex() - 1
+        if error_index >= 0 and error_index in (
+            self.x_combo.currentIndex(), self.y_combo.currentIndex()
+        ):
+            QtWidgets.QMessageBox.warning(
+                self, "Invalid Uncertainty Column",
+                "The uncertainty column must be different from X and Y.",
+            )
+            return
+        super().accept()
+
+    def selection(self):
+        error_index = self.error_combo.currentIndex() - 1
+        error_kind = (
+            self.error_kind_combo.currentText().casefold()
+            if error_index >= 0 else None
+        )
+        return (
+            self.x_combo.currentIndex(), self.y_combo.currentIndex(),
+            error_index if error_index >= 0 else None, error_kind,
+        )
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)        
@@ -127,6 +217,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.curve_headers = list()
         self.curve_units = list()
         self.curve_has_error = list()
+        # Error-column semantics: ``sigma`` is a standard deviation, while
+        # ``variance`` must be square-rooted before weighted fitting.
+        self.curve_error_kind = list()
         self.factors = dict()
         self.lastcolorindex = -1
         self.Z = param['default_element']
@@ -339,28 +432,32 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def setActionLinLin(self):
         param['plotstyle'] = 'linlin'        
-        self.initPlot()
-        self.updatePlotWidget1()
+        self._redraw_left_and_result_plots()
 
     def setActionLinLog(self):
         param['plotstyle'] = 'linlog'        
-        self.initPlot()
-        self.updatePlotWidget1()
+        self._redraw_left_and_result_plots()
     
     def setActionLogLin(self):
         param['plotstyle'] = 'loglin'        
-        self.initPlot()
-        self.updatePlotWidget1()
+        self._redraw_left_and_result_plots()
 
     def setActionLogLog(self):
         param['plotstyle'] = 'loglog'        
-        self.initPlot()
-        self.updatePlotWidget1()
+        self._redraw_left_and_result_plots()
     
     def setActionKratky(self):
         param['plotstyle'] = 'kratky'
-        self.initPlot()
+        self._redraw_left_and_result_plots()
+
+    def _redraw_left_and_result_plots(self):
+        """Apply plot style to q plots without touching the energy panel."""
+        log_x = param['plotstyle'] in ('loglog', 'loglin', 'kratky')
+        log_y = param['plotstyle'] in ('loglog', 'linlog')
+        self.plotWidget[0].setLogMode(x=log_x, y=log_y)
         self.updatePlotWidget1()
+        if all(key in self.result for key in ('q', 'I0', 'I0R', 'IR')):
+            self._plot_stuhrmann_result()
     
     def openExportDialog(self):
         # Use a dialog instance so New Folder works reliably and the selected
@@ -440,6 +537,32 @@ class MainWindow(QtWidgets.QMainWindow):
         options |= QFileDialog.Option.DontUseNativeDialog
         files, _ = QFileDialog.getOpenFileNames(self, title, self.appImportPath, "All Files (*);;Dat Files (*.dat)","Dat Files (*.dat)",options=options)
         if files:
+            try:
+                first_data = np.asarray(np.loadtxt(
+                    files[0], delimiter=param['import_ascii_delimiter'],
+                    comments=param['import_ascii_comments'],
+                ))
+                if first_data.ndim != 2 or first_data.shape[1] < 2:
+                    raise ValueError("ASCII curve must contain at least two columns")
+                first_names = self._read_ascii_column_names(files[0])
+                choices = [
+                    f"Column {index + 1}: {first_names[index]}"
+                    if len(first_names) == first_data.shape[1]
+                    else f"Column {index + 1}"
+                    for index in range(first_data.shape[1])
+                ]
+                column_dialog = XYSelectionDialog(choices, self)
+                if column_dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+                    return
+                x_index, y_index, error_index, selected_error_kind = (
+                    column_dialog.selection()
+                )
+            except (OSError, TypeError, ValueError, IndexError) as exc:
+                QtWidgets.QMessageBox.critical(
+                    self, "Cannot Import ASCII Data", str(exc)
+                )
+                return
+
             # New rows inherit the shift settings already in use. This keeps a
             # later import consistent with the current measurement series.
             if self.tableModel.rowCount() > 0:
@@ -484,15 +607,50 @@ class MainWindow(QtWidgets.QMainWindow):
                         pass
                 
                 try:
-                    source_header, q_unit, has_error = self._read_curve_header(item)
+                    source_header, q_unit, error_kind = self._read_curve_header(item)
                     data = np.loadtxt(item,delimiter=param['import_ascii_delimiter'],comments=param['import_ascii_comments'])
                     data = np.asarray(data)
                     if data.ndim != 2 or data.shape[1] < 2:
                         raise ValueError("ASCII curve must contain at least two columns")
-                    self.curves.append(data)
+                    selected_indices = [x_index, y_index]
+                    if error_index is not None:
+                        selected_indices.append(error_index)
+                    if max(selected_indices) >= data.shape[1]:
+                        raise ValueError(
+                            f"{fname} has only {data.shape[1]} columns; "
+                            "the selected columns are unavailable."
+                        )
+                    column_names = self._read_ascii_column_names(item)
+                    x_name = (
+                        column_names[x_index]
+                        if len(column_names) == data.shape[1]
+                        else f"Column_{x_index + 1}"
+                    )
+                    y_name = (
+                        column_names[y_index]
+                        if len(column_names) == data.shape[1]
+                        else f"Column_{y_index + 1}"
+                    )
+                    source_header = f"{x_name}\t{y_name}"
+                    q_unit = 'A' if x_name.lower().startswith('q_a^-1') else 'nm'
+                    selected_columns = [data[:, x_index], data[:, y_index]]
+                    if error_index is not None:
+                        selected_columns.append(data[:, error_index])
+                    self.curves.append(np.column_stack(selected_columns))
                     self.curve_headers.append(source_header)
                     self.curve_units.append(q_unit)
-                    self.curve_has_error.append(has_error and data.shape[1] >= 3)
+                    file_error_kind = selected_error_kind
+                    if (
+                        error_index is not None
+                        and len(column_names) == data.shape[1]
+                    ):
+                        detected_kind = uncertainty_kind_from_column_name(
+                            column_names[error_index]
+                        )
+                        if detected_kind is not None:
+                            file_error_kind = detected_kind
+                    self.curve_error_kind.append(file_error_kind)
+                    self.curve_has_error.append(error_index is not None)
                 except (OSError, TypeError, ValueError, IndexError):
                     continue
                 
@@ -514,6 +672,35 @@ class MainWindow(QtWidgets.QMainWindow):
             self.pushButton_8.setEnabled(True)
             self.pushButton_9.setEnabled(True)
             self.pushButton_3.setEnabled(True)
+
+    @staticmethod
+    def _read_ascii_column_names(filename):
+        """Return names from the comment immediately above numeric data."""
+        previous_line = ''
+        with open(filename, 'r', encoding='utf-8-sig', errors='replace') as stream:
+            for line in stream:
+                stripped = line.strip()
+                if not stripped:
+                    previous_line = ''
+                    continue
+                if stripped.startswith(param['import_ascii_comments']):
+                    previous_line = stripped
+                    continue
+                try:
+                    fields = re.split(r'[\s,]+', stripped)
+                    [float(field) for field in fields if field]
+                except ValueError:
+                    previous_line = stripped
+                    continue
+                break
+        if not previous_line.startswith(param['import_ascii_comments']):
+            return []
+        return [
+            token for token in re.split(
+                r'[\s,]+',
+                previous_line.lstrip(param['import_ascii_comments']).strip(),
+            ) if token
+        ]
 
     @staticmethod
     def _read_curve_header(filename):
@@ -549,12 +736,8 @@ class MainWindow(QtWidgets.QMainWindow):
         first_column = tokens[0].lower() if tokens else 'q_nm^-1'
         q_unit = 'A' if first_column.startswith('q_a^-1') else 'nm'
         third_column = tokens[2].casefold() if len(tokens) >= 3 else ''
-        error_names = {
-            'sigma', 'error', 'errors', 'uncertainty', 'uncertainties',
-            'std', 'stdev', 'stddev', 'standard_deviation',
-        }
-        has_error = third_column in error_names
-        return source_header, q_unit, has_error
+        error_kind = uncertainty_kind_from_column_name(third_column)
+        return source_header, q_unit, error_kind
 
     def updatePlotWidget1(self):
         ''' this will update the plot widget of the input curves'''
@@ -565,17 +748,19 @@ class MainWindow(QtWidgets.QMainWindow):
             legend = f"{self.tableModel.get(i, 2)} ({self.tableModel.get(i, 6):g} eV)"
             if self.tableModel.get(i,7)==True and self.tableModel.get(i,9) == False:
                 c = self.curves[i]
+                y_values = np.abs(c[:,1]) if param['plotstyle'] in ('loglog', 'linlog') else c[:,1]
                 if param['plotstyle'] == 'kratky':
                     p.plot(c[:,0],c[:,1]*c[:,0]**2,pen=pg.mkPen(self.tableModel.get(i,8),width=param['linewidth_show'],style=param['linestyle_show']), name=legend)
                 else:
-                    p.plot(c[:,0],c[:,1],pen=pg.mkPen(self.tableModel.get(i,8),width=param['linewidth_show'],style=param['linestyle_show']), name=legend)
+                    p.plot(c[:,0],y_values,pen=pg.mkPen(self.tableModel.get(i,8),width=param['linewidth_show'],style=param['linestyle_show']), name=legend)
             elif self.tableModel.get(i,7)==True and self.tableModel.get(i,9)==True:
                 c = self.curves[i]
+                y_values = np.abs(c[:,1]) if param['plotstyle'] in ('loglog', 'linlog') else c[:,1]
                 if param['plotstyle'] == 'kratky':
                     p.plot(c[:,0],c[:,1]*c[:,0]**2,pen=pg.mkPen(self.tableModel.get(i,8),width=param['linewidth_use'],style=param['linestyle_use']), name=legend)
                 else:
-                    p.plot(c[:,0],c[:,1],pen=pg.mkPen(self.tableModel.get(i,8),width=param['linewidth_use'],style=param['linestyle_use']), name=legend)
-        self._auto_scale_plot(p)
+                    p.plot(c[:,0],y_values,pen=pg.mkPen(self.tableModel.get(i,8),width=param['linewidth_use'],style=param['linestyle_use']), name=legend)
+        self._auto_scale_plot(p, exact_x=True)
         self._update_q_axis_labels()
 
     def _update_q_axis_labels(self, curve_index=0):
@@ -592,12 +777,60 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plotWidget[1].setLabel(
             'bottom', label, **{'font-size': '12pt', 'color': '#202020'}
         )
+        # q is already stored in the requested physical unit. Do not let
+        # pyqtgraph replace it with an SI-scaled axis such as "(x0.001)".
+        for plot in self.plotWidget[:2]:
+            axis = plot.getAxis('bottom')
+            axis.enableAutoSIPrefix(False)
+            axis.setScale(1.0)
 
     @staticmethod
-    def _auto_scale_plot(plot):
+    def _auto_scale_plot(plot, exact_x=False):
         """Enable and immediately apply automatic X/Y range scaling."""
         plot.autoRange()
         plot.enableAutoRange(axis=pg.ViewBox.XYAxes, enable=True)
+        if exact_x:
+            bounds = [
+                item.dataBounds(ax=0, frac=1.0)
+                for item in plot.listDataItems()
+            ]
+            bounds = [
+                bound for bound in bounds
+                if bound is not None and len(bound) == 2
+                and np.all(np.isfinite(bound)) and bound[0] < bound[1]
+            ]
+            if bounds:
+                minimum = min(bound[0] for bound in bounds)
+                maximum = max(bound[1] for bound in bounds)
+                plot.setXRange(minimum, maximum, padding=0.0)
+
+    def _plot_stuhrmann_result(self):
+        """Draw the cached absolute-valued Stuhrmann separation."""
+        p = self.plotWidget[1]
+        p.clear()
+        self._update_q_axis_labels(
+            self.result.get('index_use', [0])[0]
+            if self.result.get('index_use') else 0
+        )
+        q = np.asarray(self.result['q'])
+        I0 = np.asarray(self.result['I0'])
+        I0R = np.asarray(self.result['I0R'])
+        IR = np.asarray(self.result['IR'])
+        requested_log_x = param['plotstyle'] in ('loglog', 'loglin', 'kratky')
+        requested_log_y = param['plotstyle'] in ('loglog', 'linlog')
+        p.setLogMode(x=requested_log_x, y=requested_log_y)
+        q_display = np.where(q > 0, q, np.nan) if requested_log_x else q
+        I0_display = np.where(I0 > 0, I0, np.nan) if requested_log_y else I0
+        I0R_display = np.where(I0R > 0, I0R, np.nan) if requested_log_y else I0R
+        IR_display = np.where(IR > 0, IR, np.nan) if requested_log_y else IR
+        p.plot(q_display, I0_display, pen=pg.mkPen('#2ca02c', width=2), name='I0')
+        p.plot(q_display, I0R_display, pen=pg.mkPen('#1f77b4', width=2), name='I0R')
+        p.plot(
+            q_display, IR_display,
+            pen=pg.mkPen('#d95f02', width=2, style=Qt.PenStyle.DotLine),
+            name='IR',
+        )
+        self._auto_scale_plot(p, exact_x=True)
 
     def setColorPalette(self, palette_name):
         """Apply a Plot-menu color list to existing and future curves."""
@@ -654,6 +887,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.curve_headers.pop(index.row())
         self.curve_units.pop(index.row())
         self.curve_has_error.pop(index.row())
+        self.curve_error_kind.pop(index.row())
         self.tableModel.removeDataset(index)
         self.updatePlotWidget1()
         if self.tableModel.rowCount() == 0:
@@ -677,6 +911,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.curve_units.insert(target_row, unit)
         has_error = self.curve_has_error.pop(source_row)
         self.curve_has_error.insert(target_row, has_error)
+        error_kind = self.curve_error_kind.pop(source_row)
+        self.curve_error_kind.insert(target_row, error_kind)
         self.updatePlotWidget1()
         if 'nrj_all' in self.factors:
             self.getAnomalousFactors()
@@ -780,9 +1016,14 @@ class MainWindow(QtWidgets.QMainWindow):
         s = nrj_max * param['energy resolution']
         gx = np.linspace(-50,50,int(100/deltaX)+1)
         gy = np.exp(-(gx)**2/(2*s**2))/(s*np.sqrt(2*np.pi))
-        conv_feff = np.convolve(c_feffraw,gy,'same')/np.sum(gy)
-        conv_f1 = np.convolve(c_f1raw,gy,'same')/np.sum(gy)
-        conv_f2 = np.convolve(c_f2raw,gy,'same')/np.sum(gy)
+        # Convolve the coefficients used by the Stuhrmann matrix.  The
+        # quadratic coefficient is <f1**2 + f2**2>, not
+        # <f1>**2 + <f2>**2 (these differ near an absorption edge).
+        norm = np.sum(gy)
+        conv_feff = np.convolve(c_feffraw, gy, 'same') / norm
+        conv_f1 = np.convolve(c_f1raw, gy, 'same') / norm
+        conv_f2 = np.convolve(c_f2raw, gy, 'same') / norm
+        conv_c2 = np.convolve(c_f1raw**2 + c_f2raw**2, gy, 'same') / norm
         
         feff_raw = c_feffraw[50:-50]
         feff = conv_feff[50:-50]
@@ -792,6 +1033,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.factors['f0_all'] = c_f0
         self.factors['f1_all'] = conv_f1[50:-50]
         self.factors['f2_all'] = conv_f2[50:-50]
+        self.factors['c2_all'] = conv_c2[50:-50]
         self.factors['feff_all']=feff
         self.factors['feff_raw']=feff_raw
 
@@ -801,10 +1043,12 @@ class MainWindow(QtWidgets.QMainWindow):
         feff_use = np.interp(nrj_chem, X,feff)
         f1_use = np.interp(nrj_chem,X,conv_f1[50:-50])
         f2_use = np.interp(nrj_chem,X,conv_f2[50:-50])
+        c2_use = np.interp(nrj_chem,X,conv_c2[50:-50])
 
         self.factors['feff_use'] = feff_use[:]
         self.factors['f1_use'] = f1_use[:]
         self.factors['f2_use'] = f2_use[:]
+        self.factors['c2_use'] = c2_use[:]
         self.factors['index_use']=index_use
 
         # update table model
@@ -909,49 +1153,81 @@ class MainWindow(QtWidgets.QMainWindow):
         ])
         sigmas = None
         if use_errors:
-            sigmas = np.column_stack([
-                np.interp(q1, curve[:, 0], curve[:, 2])
-                for curve in sorted_curves
-            ])
+            sigma_columns = []
+            for item, curve in zip(index_use, sorted_curves):
+                column = np.interp(q1, curve[:, 0], curve[:, 2])
+                # pyFAI ASCII output is sigma.  Explicitly labelled
+                # variance files are converted to sigma exactly once.
+                if self.curve_error_kind[item] == 'variance':
+                    column = np.sqrt(np.maximum(column, 0.0))
+                sigma_columns.append(column)
+            sigmas = np.column_stack(sigma_columns)
 
         matA = np.column_stack((
             np.ones(len(f1)),
             2.0 * f1,
-            f1 ** 2 + f2 ** 2,
+            self.factors.get('c2_use', self.factors['f1_use']**2 + self.factors['f2_use']**2)[index_use],
         ))
+        rank = np.linalg.matrix_rank(matA)
+        condition_number = np.linalg.cond(matA)
+        if rank < 3 or not np.isfinite(condition_number) or condition_number > 1e10:
+            QtWidgets.QMessageBox.warning(
+                self, 'Ill-conditioned ASAXS separation',
+                f'The selected energies give rank={rank} and condition number='
+                f'{condition_number:.3g}. Choose energies with stronger independent '
+                'variation in f1 and f2.'
+            )
+            return
 
         # Compute every q point in one LAPACK call. Weighted points are then
         # replaced individually because their design matrix depends on Sigma.
         solutions = np.linalg.lstsq(matA, intensities.T, rcond=None)[0]
+        solution_errors = None
         if use_errors:
+            solution_errors = np.full((3, q1.size), np.nan)
             valid_error_rows = np.all(np.isfinite(sigmas) & (sigmas > 0), axis=1)
             for point_index in np.flatnonzero(valid_error_rows):
                 weights = 1.0 / sigmas[point_index]
-                solutions[:, point_index] = np.linalg.lstsq(
-                    matA * weights[:, np.newaxis],
-                    intensities[point_index] * weights,
-                    rcond=None,
-                )[0]
+                weighted_a = matA * weights[:, np.newaxis]
+                weighted_y = intensities[point_index] * weights
+                fit = np.linalg.lstsq(weighted_a, weighted_y, rcond=None)
+                solutions[:, point_index] = fit[0]
+                # Linear weighted-least-squares covariance.  For exactly
+                # three energies there are no residual degrees of freedom;
+                # retain the supplied counting-error scale in that case.
+                normal = weighted_a.T @ weighted_a
+                try:
+                    covariance = np.linalg.inv(normal)
+                    dof = max(len(f1) - 3, 1)
+                    chi2 = np.sum((weighted_a @ fit[0] - weighted_y) ** 2)
+                    solution_errors[:, point_index] = np.sqrt(
+                        np.maximum(np.diag(covariance) * chi2 / dof, 0.0)
+                    )
+                except np.linalg.LinAlgError:
+                    pass
 
         I0, I0R, IR = solutions
-        
-        # Three distinct result colors, each one width step thicker than the
-        # previous default-width curves for clearer comparison.
-        p.plot(q1,np.abs(I0),pen=pg.mkPen('#2ca02c', width=2),name='I0')
-        p.plot(q1,np.abs(I0R),pen=pg.mkPen('#1f77b4', width=2),name='I0R')
-        p.plot(
-            q1, np.abs(IR),
-            pen=pg.mkPen('#d95f02', width=2, style=Qt.PenStyle.DotLine),
-            name='IR',
-        )
-        self._auto_scale_plot(p)
+        # Match the validated Stuhrmann implementation: all three separated
+        # profiles are displayed and exported as magnitudes.
+        I0_display = np.abs(I0)
+        I0R_display = np.abs(I0R)
+        IR_display = np.abs(IR)
 
         self.result = dict()
         self.result['q'] = q1[:]
-        self.result['I0'] = np.abs(I0[:])
-        self.result['I0R'] = np.abs(I0R[:])
-        self.result['IR'] = np.abs(IR[:])
-        self.result['index_use']=index_use
+        self.result['I0'] = I0_display[:]
+        self.result['I0R'] = I0R_display[:]
+        self.result['IR'] = IR_display[:]
+        self.result['index_use'] = index_use
+        # Applying Stuhrmann always returns the two q-space panels to the
+        # conventional LogLog presentation. The energy/factor panel is left
+        # exactly as it was.
+        param['plotstyle'] = 'loglog'
+        self._redraw_left_and_result_plots()
+        if solution_errors is not None:
+            self.result['I0_err'] = solution_errors[0].copy()
+            self.result['I0R_err'] = solution_errors[1].copy()
+            self.result['IR_err'] = solution_errors[2].copy()
         fname = list()
         nrj = list()
         f1_res = list()
@@ -969,6 +1245,41 @@ class MainWindow(QtWidgets.QMainWindow):
         self.result['f1'] = f1_res
         self.result['f2'] = f2_res
         self.result['feff'] = feff_res
+        first_source_index = index_use[0] if index_use else 0
+        self.result['source_header'] = (
+            self.curve_headers[first_source_index]
+            if first_source_index < len(self.curve_headers)
+            else 'q_nm^-1\tIntensity'
+        )
+        # Export Curves is valid as soon as the standard Stuhrmann matrix
+        # calculation has populated the complete result dictionary.
+        self.pushButton_6.setEnabled(True)
+        self.statusbar.showMessage(
+            'Stuhrmann separation complete; curves are ready to export'
+        )
+
+    def runGlobalModelVersion(self):
+        """Run the bundled multi-energy global ASAXS model fit."""
+        if fit_asaxs_global is None:
+            QtWidgets.QMessageBox.warning(self, 'Global model fit',
+                                          'asaxs_global_fit.py could not be imported.')
+            return
+        index_use = [i for i in range(self.tableModel.rowCount()) if self.tableModel.get(i, 9)]
+        if len(index_use) < 2:
+            QtWidgets.QMessageBox.warning(self, 'Global model fit',
+                                          'Select at least two ASAXS curves first.')
+            return
+        try:
+            result = fit_asaxs_global(
+                [self.curves[i] for i in index_use],
+                [self.tableModel.get(i, 6) for i in index_use],
+                self.factors['f1_use'][index_use], self.factors['f2_use'][index_use],
+                error_kind='sigma' if all(self.curve_has_error[i] for i in index_use) else None)
+            self.statusbar.showMessage('Global model fit completed: chi2/dof = %.4g' % (result.chi2 / max(result.dof, 1)))
+            QtWidgets.QMessageBox.information(self, 'Global model fit',
+                                               'Fit completed.\n' + '\n'.join(f'{k} = {v:.6g}' for k, v in result.parameters.items()))
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, 'Global model fit', str(exc))
         first_source_index = index_use[0] if index_use else 0
         self.result['source_header'] = (
             self.curve_headers[first_source_index]
