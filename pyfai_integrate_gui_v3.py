@@ -1594,6 +1594,9 @@ class MultiAsciiCurveWindow(qt.QMainWindow):
         self._curve_items = {}
         self._curve_sources = {}
         self._filter_window = None
+        self._subtraction_settings = []
+        self._subtraction_results = {}
+        self._subtraction_window = None
         self._input_path = str(Path(curves[0][3]).parent) if curves else ""
 
         # Expose silx's native logarithmic-axis actions in Plot1D's main
@@ -1628,14 +1631,20 @@ class MultiAsciiCurveWindow(qt.QMainWindow):
             "Import more ASCII curves into this window"
         )
         self.add_data_action.triggered.connect(self.add_ascii_data)
-        self.subtract_action = plot_toolbar.addAction("Subtract Curves")
+        self.subtract_action = plot_toolbar.addAction("Subtraction...")
         self.subtract_action.setToolTip(
-            "Choose which curve to subtract from and which curve to subtract"
+            "Configure up to two scaled reference curves"
         )
         self.subtract_action.triggered.connect(self.subtract_selected_curves)
+        self.save_data_action = plot_toolbar.addAction("Save Data...")
+        self.save_data_action.setToolTip(
+            "Save each selected or checked data curve as a separate .dat file"
+        )
+        self.save_data_action.triggered.connect(self.save_ascii_data)
         options_menu = self.menuBar().addMenu("Options")
         options_menu.addAction(self.add_data_action)
         options_menu.addAction(self.subtract_action)
+        options_menu.addAction(self.save_data_action)
         options_menu.addSeparator()
         options_menu.addAction(self.filter_action)
         options_menu.addAction(self.save_filtered_action)
@@ -1662,16 +1671,73 @@ class MultiAsciiCurveWindow(qt.QMainWindow):
         curve_list.setDropIndicatorShown(True)
         curve_list.setDragDropMode(qt.QAbstractItemView.InternalMove)
         curve_list.setDefaultDropAction(qt.Qt.MoveAction)
+        curve_list.setContextMenuPolicy(qt.Qt.CustomContextMenu)
         visibility_layout.addWidget(curve_list, 1)
         visibility_dock.setWidget(visibility_widget)
         self.addDockWidget(qt.Qt.RightDockWidgetArea, visibility_dock)
         self.curve_list = curve_list
         self.select_all_check.toggled.connect(self._toggle_all_curves)
         curve_list.itemChanged.connect(self._curve_visibility_changed)
+        curve_list.customContextMenuRequested.connect(
+            self._show_curve_list_context_menu
+        )
 
         for curve_info in curves:
             self._add_curve(curve_info)
         self.plot.resetZoom()
+
+    @qt.Slot(qt.QPoint)
+    def _show_curve_list_context_menu(self, position):
+        item = self.curve_list.itemAt(position)
+        if item is None:
+            return
+        if not item.isSelected():
+            self.curve_list.clearSelection()
+            item.setSelected(True)
+        selected_count = len(self.curve_list.selectedItems())
+        menu = qt.QMenu(self.curve_list)
+        remove_action = menu.addAction(
+            "Remove Curve" if selected_count == 1 else
+            f"Remove {selected_count} Curves"
+        )
+        chosen = menu.exec(self.curve_list.viewport().mapToGlobal(position))
+        if chosen is remove_action:
+            self._remove_selected_curves()
+
+    def _remove_selected_curves(self):
+        selected_items = list(self.curve_list.selectedItems())
+        if not selected_items:
+            return
+        removed_legends = {item.text() for item in selected_items}
+        if any(
+            setting[0] in removed_legends
+            for setting in self._subtraction_settings
+        ):
+            for target in list(self._subtraction_results):
+                self.plot.removeCurve(f"Subtracted: {target}")
+            self._subtraction_settings = []
+            self._subtraction_results.clear()
+        for item in selected_items:
+            legend = item.text()
+            self.plot.removeCurve(f"Filtered points: {legend}")
+            self.plot.removeCurve(f"Subtracted: {legend}")
+            self.plot.removeCurve(legend)
+            self._subtraction_results.pop(legend, None)
+            self._curve_data.pop(legend, None)
+            self._curve_sources.pop(legend, None)
+            self._curve_items.pop(legend, None)
+            self.curve_list.takeItem(self.curve_list.row(item))
+        all_checked = self.curve_list.count() > 0 and all(
+            self.curve_list.item(index).checkState() == qt.Qt.Checked
+            for index in range(self.curve_list.count())
+        )
+        self.select_all_check.blockSignals(True)
+        self.select_all_check.setChecked(all_checked)
+        self.select_all_check.blockSignals(False)
+        self.plot.resetZoom()
+        self.statusBar().showMessage(
+            f"Removed {len(selected_items)} curve(s)", 5000
+        )
 
     def _unique_legend(self, requested):
         if requested not in self._curve_data:
@@ -1750,111 +1816,260 @@ class MultiAsciiCurveWindow(qt.QMainWindow):
 
     @qt.Slot()
     def subtract_selected_curves(self):
-        if self.curve_list.count() < 2:
-            qt.QMessageBox.information(
-                self, "Two Curves Required",
-                "Add at least two curves before subtracting.",
-            )
+        if self._subtraction_window is not None:
+            self._subtraction_window.raise_()
+            self._subtraction_window.activateWindow()
             return
         legends = [
             self.curve_list.item(row).text()
             for row in range(self.curve_list.count())
         ]
-        selected = self.curve_list.selectedItems()
+        if not legends:
+            qt.QMessageBox.information(self, "No Curves", "Add curve data first.")
+            return
+        selected = [item.text() for item in self.curve_list.selectedItems()]
         dialog = qt.QDialog(self)
-        dialog.setWindowTitle("Subtract Curves")
-        layout = qt.QFormLayout(dialog)
-        minuend_combo = qt.QComboBox(dialog)
-        subtrahend_combo = qt.QComboBox(dialog)
-        minuend_combo.addItems(legends)
-        subtrahend_combo.addItems(legends)
-        if len(selected) == 2:
-            selected_rows = sorted(self.curve_list.row(item) for item in selected)
-            minuend_combo.setCurrentIndex(selected_rows[0])
-            subtrahend_combo.setCurrentIndex(selected_rows[1])
-        else:
-            subtrahend_combo.setCurrentIndex(1)
-        layout.addRow("Curve to subtract from", minuend_combo)
-        layout.addRow("Curve to subtract", subtrahend_combo)
-        preview = qt.QLabel(dialog)
-        layout.addRow("Calculation", preview)
+        dialog.setWindowTitle("ASCII Curve Subtraction")
+        dialog.setAttribute(qt.Qt.WA_DeleteOnClose)
+        dialog.setModal(False)
+        layout = qt.QVBoxLayout(dialog)
+        layout.addWidget(qt.QLabel(
+            "Choose one data curve and zero, one, or two reference curves."
+        ))
+        grid = qt.QGridLayout()
+        data_combo = qt.QComboBox(dialog)
+        data_combo.addItems(legends)
+        if selected:
+            data_combo.setCurrentText(selected[0])
+        grid.addWidget(qt.QLabel("Data curve"), 0, 0)
+        grid.addWidget(data_combo, 0, 1, 1, 3)
+        for column, label in enumerate((
+            "Reference curve", "Show", "Subtract", "Scale factor"
+        )):
+            grid.addWidget(qt.QLabel(label), 1, column)
+        rows = []
+        for row_index in range(2):
+            combo = qt.QComboBox(dialog)
+            combo.addItem("None")
+            combo.addItems(legends)
+            show_check = qt.QCheckBox(dialog)
+            subtract_check = qt.QCheckBox(dialog)
+            factor = qt.QDoubleSpinBox(dialog)
+            factor.setDecimals(8)
+            factor.setRange(-1.0e12, 1.0e12)
+            factor.setValue(1.0)
+            if row_index + 1 < len(selected):
+                combo.setCurrentText(selected[row_index + 1])
+                show_check.setChecked(True)
+                subtract_check.setChecked(True)
+            if row_index < len(self._subtraction_settings):
+                old_name, old_show, old_subtract, old_factor = (
+                    self._subtraction_settings[row_index]
+                )
+                old_index = combo.findText(old_name)
+                combo.setCurrentIndex(max(0, old_index))
+                show_check.setChecked(old_show)
+                subtract_check.setChecked(old_subtract)
+                factor.setValue(old_factor)
+            grid.addWidget(combo, row_index + 2, 0)
+            grid.addWidget(show_check, row_index + 2, 1)
+            grid.addWidget(subtract_check, row_index + 2, 2)
+            grid.addWidget(factor, row_index + 2, 3)
+            rows.append((combo, show_check, subtract_check, factor))
+        layout.addLayout(grid)
+        subtract_button = qt.QPushButton("Subtract", dialog)
+        layout.addWidget(subtract_button)
 
-        def update_preview(*_args):
-            preview.setText(
-                f"{minuend_combo.currentText()} − "
-                f"{subtrahend_combo.currentText()}"
-            )
-
-        minuend_combo.currentIndexChanged.connect(update_preview)
-        subtrahend_combo.currentIndexChanged.connect(update_preview)
-        update_preview()
-        buttons = qt.QDialogButtonBox(
-            qt.QDialogButtonBox.Ok | qt.QDialogButtonBox.Cancel, dialog
-        )
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addRow(buttons)
-        if dialog.exec() != qt.QDialog.Accepted:
-            return
-        first_legend = minuend_combo.currentText()
-        second_legend = subtrahend_combo.currentText()
-        if first_legend == second_legend:
-            qt.QMessageBox.warning(
-                self, "Select Different Curves",
-                "The curve to subtract from and the curve to subtract must differ.",
-            )
-            return
-        first_curve = self.plot.getCurve(first_legend)
-        second_curve = self.plot.getCurve(second_legend)
-        first_x = first_curve.getXData(copy=False)
-        first_y = first_curve.getYData(copy=False)
-        second_x = second_curve.getXData(copy=False)
-        second_y = second_curve.getYData(copy=False)
-        first_x = np.asarray(first_x, dtype=np.float64)
-        first_y = np.asarray(first_y, dtype=np.float64)
-        second_x = np.asarray(second_x, dtype=np.float64)
-        second_y = np.asarray(second_y, dtype=np.float64)
-        if first_x.size == 0 or second_x.size == 0:
-            qt.QMessageBox.critical(self, "Cannot Subtract", "A selected curve is empty.")
-            return
-        if np.array_equal(first_x, second_x):
-            result_x = first_x
-            result_y = first_y - second_y
-        else:
-            finite_second = np.isfinite(second_x) & np.isfinite(second_y)
-            second_x = second_x[finite_second]
-            second_y = second_y[finite_second]
-            if second_x.size == 0:
-                qt.QMessageBox.critical(
-                    self, "Cannot Subtract",
-                    "The second selected curve has no finite data points.",
+        def apply_subtraction():
+            target = data_combo.currentText()
+            settings = [
+                (
+                    combo.currentText(), show_check.isChecked(),
+                    subtract_check.isChecked(), factor.value(),
+                )
+                for combo, show_check, subtract_check, factor in rows
+                if combo.currentIndex() > 0
+            ]
+            reference_names = [setting[0] for setting in settings]
+            if target in reference_names:
+                qt.QMessageBox.warning(
+                    dialog, "Invalid Reference",
+                    "The data curve cannot also be a reference curve.",
                 )
                 return
-            order = np.argsort(second_x)
-            sorted_x = second_x[order]
-            sorted_y = second_y[order]
-            unique_x, unique_indices = np.unique(sorted_x, return_index=True)
-            sorted_y = sorted_y[unique_indices]
-            overlap = (
-                np.isfinite(first_x) & np.isfinite(first_y)
-                & (first_x >= unique_x[0]) & (first_x <= unique_x[-1])
-            )
-            if unique_x.size < 2 or not np.any(overlap):
-                qt.QMessageBox.critical(
-                    self, "Cannot Subtract",
-                    "The selected curves do not have a usable common X range.",
+            if len(reference_names) != len(set(reference_names)):
+                qt.QMessageBox.warning(
+                    dialog, "Duplicate Reference",
+                    "Reference 1 and Reference 2 must be different curves.",
                 )
                 return
-            result_x = first_x[overlap]
-            result_y = first_y[overlap] - np.interp(
-                result_x, unique_x, sorted_y
-            )
-        legend = f"{first_legend} - {second_legend}"
-        added_legend = self._add_curve((legend, result_x, result_y, legend, ""))
-        self.curve_list.clearSelection()
-        self._curve_items[added_legend].setSelected(True)
+            self._subtraction_settings = settings
+            try:
+                self._apply_ascii_subtraction([target], settings)
+            except ValueError as error:
+                qt.QMessageBox.critical(dialog, "Cannot Subtract", str(error))
+
+        subtract_button.clicked.connect(apply_subtraction)
+        dialog.destroyed.connect(self._subtraction_window_destroyed)
+        self._subtraction_window = dialog
+        dialog.show()
+
+    @qt.Slot()
+    def _subtraction_window_destroyed(self, _object=None):
+        self._subtraction_window = None
+
+    @staticmethod
+    def _interpolate_reference(target_x, reference_x, reference_y):
+        finite = np.isfinite(reference_x) & np.isfinite(reference_y)
+        reference_x = np.asarray(reference_x, dtype=np.float64)[finite]
+        reference_y = np.asarray(reference_y, dtype=np.float64)[finite]
+        if reference_x.size < 2:
+            raise ValueError("A reference curve has fewer than two finite points.")
+        order = np.argsort(reference_x)
+        reference_x = reference_x[order]
+        reference_y = reference_y[order]
+        reference_x, unique_indices = np.unique(reference_x, return_index=True)
+        reference_y = reference_y[unique_indices]
+        if reference_x.size < 2:
+            raise ValueError("A reference curve has fewer than two unique X values.")
+        return np.interp(target_x, reference_x, reference_y)
+
+    def _apply_ascii_subtraction(self, targets, settings=None):
+        settings = self._subtraction_settings if settings is None else settings
+        for target in targets:
+            self.plot.removeCurve(f"Subtracted: {target}")
+            self._subtraction_results.pop(target, None)
+        reference_names = {setting[0] for setting in settings}
+        for name, show, _subtract, _factor in settings:
+            item = self._curve_items.get(name)
+            curve = self.plot.getCurve(name)
+            if item is not None:
+                item.setCheckState(qt.Qt.Checked if show else qt.Qt.Unchecked)
+            if curve is not None:
+                curve.setVisible(show)
+        for target in targets:
+            if target in reference_names or target not in self._curve_data:
+                continue
+            curve = self.plot.getCurve(target)
+            target_x = np.asarray(curve.getXData(copy=False), dtype=np.float64)
+            target_y = np.asarray(curve.getYData(copy=False), dtype=np.float64)
+            keep = np.isfinite(target_x) & np.isfinite(target_y)
+            for name, _show, subtract, _factor in settings:
+                if not subtract:
+                    continue
+                reference_x, _reference_y = self._curve_data[name]
+                finite_x = np.asarray(reference_x)[np.isfinite(reference_x)]
+                if finite_x.size < 2:
+                    raise ValueError(f"{name} has no usable X range.")
+                keep &= (target_x >= np.min(finite_x)) & (target_x <= np.max(finite_x))
+            if not np.any(keep):
+                raise ValueError(f"{target} has no common X range with its references.")
+            result_x = target_x[keep]
+            sample = target_y[keep]
+            corrected = sample.copy()
+            reference_columns = []
+            for name, show, subtract, factor in settings:
+                reference_x, reference_y = self._curve_data[name]
+                scaled = factor * self._interpolate_reference(
+                    result_x, np.asarray(reference_x), np.asarray(reference_y)
+                )
+                reference_columns.append((name, scaled, show, subtract, factor))
+                if subtract:
+                    corrected -= scaled
+            self._subtraction_results[target] = {
+                "x": result_x, "sample": sample, "corrected": corrected,
+                "references": reference_columns,
+            }
+            if any(setting[2] for setting in settings):
+                self.plot.addCurve(
+                    result_x, corrected, legend=f"Subtracted: {target}",
+                    linestyle="--", resetzoom=False,
+                )
         self.plot.resetZoom()
-        self.statusBar().showMessage(f"Created {added_legend}", 8000)
+        self.statusBar().showMessage(
+            f"Calculated subtraction for {len(targets)} data curve(s)",
+            8000,
+        )
+
+    @qt.Slot()
+    def save_ascii_data(self):
+        selected = [item.text() for item in self.curve_list.selectedItems()]
+        legends = selected or [
+            self.curve_list.item(index).text()
+            for index in range(self.curve_list.count())
+            if self.curve_list.item(index).checkState() == qt.Qt.Checked
+        ]
+        if not legends:
+            qt.QMessageBox.information(
+                self, "No Curves", "Select or check at least one data curve."
+            )
+            return
+        first_source = Path(self._curve_sources[legends[0]][0])
+        initial_directory = (
+            str(first_source.parent) if first_source.parent.is_dir()
+            else self._input_path
+        )
+        output_directory = qt.QFileDialog.getExistingDirectory(
+            self, "Select Folder for ASCII Data", initial_directory
+        )
+        if not output_directory:
+            return
+        used_names = {}
+        saved = 0
+        for legend in legends:
+            source_path = Path(self._curve_sources[legend][0])
+            stem = source_path.stem or "curve"
+            used_names[stem] = used_names.get(stem, 0) + 1
+            suffix = "" if used_names[stem] == 1 else f"_{used_names[stem]}"
+            output_path = Path(output_directory) / f"{stem}{suffix}.dat"
+            try:
+                overwrites_source = output_path.resolve() == source_path.resolve()
+            except OSError:
+                overwrites_source = False
+            if overwrites_source:
+                output_path = Path(output_directory) / f"{stem}_saved{suffix}.dat"
+            result = self._subtraction_results.get(legend)
+            if result is None:
+                curve = self.plot.getCurve(legend)
+                x_values = np.asarray(curve.getXData(copy=False))
+                y_values = np.asarray(curve.getYData(copy=False))
+                columns = [x_values, y_values]
+                names = [
+                    self.plot.getXAxis().getLabel(),
+                    self.plot.getYAxis().getLabel(),
+                ]
+                comments = []
+            else:
+                columns = [result["x"], result["sample"]]
+                names = [self.plot.getXAxis().getLabel(), "Intensity"]
+                comments = []
+                if any(reference[3] for reference in result["references"]):
+                    columns.append(result["corrected"])
+                    names.append("Subtracted")
+                for name, scaled, show, subtract, factor in result["references"]:
+                    columns.append(scaled)
+                    names.append(name)
+                    comments.append(
+                        f"{name}; factor: {factor:.8g}; "
+                        f"show: {show}; subtract: {subtract}"
+                    )
+            try:
+                np.savetxt(
+                    output_path, np.column_stack(columns), fmt="%.10e",
+                    delimiter="\t",
+                    header="\n".join(comments + ["\t".join(names)]),
+                )
+            except (OSError, TypeError, ValueError) as error:
+                qt.QMessageBox.critical(
+                    self, "Save Failed",
+                    f"Could not save {output_path}:\n{error}",
+                )
+                return
+            saved += 1
+        self._input_path = output_directory
+        self.statusBar().showMessage(
+            f"Saved {saved} ASCII data file(s) to {output_directory}", 8000
+        )
 
     @qt.Slot()
     def save_filtered_curves(self):
@@ -2049,6 +2264,9 @@ class MultiAsciiCurveWindow(qt.QMainWindow):
             marker = self.plot.getCurve(f"Filtered points: {item.text()}")
             if marker is not None:
                 marker.setVisible(visible)
+            subtracted = self.plot.getCurve(f"Subtracted: {item.text()}")
+            if subtracted is not None:
+                subtracted.setVisible(visible)
             self.plot.replot()
         all_checked = self.curve_list.count() > 0 and all(
             self.curve_list.item(index).checkState() == qt.Qt.Checked
